@@ -40,7 +40,8 @@ final class CpTurns {
             TYPE_U_TURN = 31, TYPE_ROUNDABOUT_RIGHT = 32, TYPE_ROUNDABOUT_LEFT = 33;
     static final int DEST_AHEAD = 112, DEST_RIGHT = 113, DEST_LEFT = 114;
     static final int GUIDE_WINDOW = 457;
-    static final int SMOOTH_MAX_M = 2 * GUIDE_WINDOW;
+    static final int SMOOTH_MAX_M = GUIDE_WINDOW;
+    static final int WRONG_WAY_RESET_M = 60, WRONG_WAY_APPROX_M = 200;
     static final long SMOOTH_MS = 250, SMOOTH_STALE_MS = 1750;
     static final long PHONE_HEARTBEAT_MS = 2000;
 
@@ -86,11 +87,11 @@ final class CpTurns {
 
     String lastTurnLog, lastRouteLog;
 
-    // Smooth approaching-turn countdown state
-    private int smCompId = -1, smManeuverIdx = -1;
-    private int prevRawMeters = -1, smBaseMeters = -1, smMinMeters = -1;
+    // Smooth approaching-turn countdown state (short units ft/m/yd only)
+    private int smCompId = -1, smManeuverIdx = -1, smClusterUnit = -1;
+    private int prevRawMeters = -1, smBaseMeters = -1;
+    private float smBaseDist = -1f, smFloorDist = 0f, smEstDist = -1f, smSpeed;
     private long prevRawAt = -10000L, smAt;
-    private float smSpeed;
     final Runnable smooth = new Runnable() {
         @Override
         public void run() {
@@ -516,6 +517,10 @@ final class CpTurns {
         cluster.crossroadName(roadText);
 
         boolean changedManeuver = (shownId != id || shownIndex != list[0] || shownType != x.type);
+        if (u.monoManeuverIdx != list[0] || u.monoManeuverType != x.type) {
+            u.resetMonotonic(list[0], x.type);
+            if (smCompId == id) resetSmooth();
+        }
         if (icon == 0) {
             logTurn(x, 0);
             if (changedManeuver && shownType >= 0) {
@@ -552,12 +557,8 @@ final class CpTurns {
         int unit;
         int owner = ownerDistanceUnit();
         if (fromSmooth) {
-            int smoothSystem = u.hasNextUnits
-                    ? ((u.nextUnits == 1 || u.nextUnits == 3 || u.nextUnits == 4) ? Car.DISTANCE_MILES : Car.DISTANCE_KM)
-                    : owner;
-            float[] du = metersToCluster(u.distNext, smoothSystem, u.nextUnits);
-            dist = du[0];
-            unit = (int) du[1];
+            dist = smEstDist;
+            unit = smClusterUnit;
         } else if (parsedStr >= 0f) {
             dist = parsedStr;
             unit = iap2UnitToCluster(u.nextUnits);
@@ -569,6 +570,17 @@ final class CpTurns {
             dist = 0f;
             unit = iap2UnitToCluster(u.nextUnits);
         }
+        if (dist >= 0f && (unit == Cluster.UNIT_MI || unit == Cluster.UNIT_KM)) {
+            dist = Math.round(dist * 10f) / 10f;
+        }
+
+        int rawMeters = (fromSmooth || u.hasDistNext) ? u.distNext : approxMeters(parsedStr, u.nextUnits);
+        int wrongWayThreshold = (fromSmooth || u.hasDistNext) ? WRONG_WAY_RESET_M : WRONG_WAY_APPROX_M;
+        if (icon != 1 && u.state != 2) {
+            float[] clamped = u.applyMonotonic(dist, unit, rawMeters, wrongWayThreshold);
+            dist = clamped[0];
+            unit = (int) clamped[1];
+        }
 
         shownId = id;
         shownIndex = list[0];
@@ -577,7 +589,7 @@ final class CpTurns {
 
         int type = icon, dir = 0, bar = 0, sides = 0, trapBar = 0;
         if (standardTurns) {
-            int metersForStd = (fromSmooth || u.hasDistNext) ? u.distNext : approxMeters(parsedStr, u.nextUnits);
+            int metersForStd = u.minRawMeters >= 0 ? u.minRawMeters : rawMeters;
             int[] s = standard(x.type, x.side, x.junction, x.exitSent, x.exit, icon, metersForStd);
             type = s[0];
             dir = s[1];
@@ -597,23 +609,40 @@ final class CpTurns {
             sendTrip(u);
             sendAhead(id, u);
             if (standardTurns && handler != null && u.hasDistNext) {
-                smoothFrom(id, list[0], u.distNext, u.timeLeft);
+                smoothFrom(id, list[0], u.distNext, dist, unit, u.minRawMeters);
             }
         }
+    }
+
+    static float unitsPerMeter(int clusterUnit) {
+        if (clusterUnit == Cluster.UNIT_FT) return 3.28084f;
+        if (clusterUnit == Cluster.UNIT_YD) return 1.09361f;
+        return 1.0f;
+    }
+
+    static float quantizeShortSmooth(float d, int clusterUnit) {
+        if (d <= 0f) return 0f;
+        if (clusterUnit == Cluster.UNIT_FT) {
+            return d < 20f ? Math.round(d) : Math.round(d / 10f) * 10f;
+        }
+        return d < 10f ? Math.round(d) : Math.round(d / 5f) * 5f;
     }
 
     private void resetSmooth() {
         if (handler != null) handler.removeCallbacks(smooth);
         smCompId = -1;
         smManeuverIdx = -1;
+        smClusterUnit = -1;
         prevRawMeters = -1;
         prevRawAt = -10000L;
         smBaseMeters = -1;
-        smMinMeters = -1;
+        smBaseDist = -1f;
+        smFloorDist = 0f;
+        smEstDist = -1f;
         smSpeed = 0f;
     }
 
-    private void smoothFrom(int compId, int maneuverIdx, int m, long timeLeft) {
+    private void smoothFrom(int compId, int maneuverIdx, int m, float shownDist, int clusterUnit, int clampedMeters) {
         if (handler == null) return;
         handler.removeCallbacks(smooth);
         long t = now();
@@ -621,7 +650,6 @@ final class CpTurns {
             smCompId = compId;
             smManeuverIdx = maneuverIdx;
             prevRawMeters = -1;
-            smMinMeters = -1;
         }
         float v = 0f;
         if (prevRawMeters >= 0 && t > prevRawAt && t - prevRawAt <= 3500L) {
@@ -630,13 +658,20 @@ final class CpTurns {
         }
         prevRawMeters = m;
         prevRawAt = t;
-        if (m <= 0 || m > SMOOTH_MAX_M || v < 1.0f) {
+
+        // Only run 250 ms interpolation in short units (ft/m/yd) inside GUIDE_WINDOW.
+        // In miles/km (0.4, 0.3, 0.2, 0.1), the cluster only displays tenths and sub-tenth
+        // interpolation fights the phone's rounded tenths due to cluster truncation.
+        boolean shortUnit = (clusterUnit == Cluster.UNIT_FT || clusterUnit == Cluster.UNIT_M || clusterUnit == Cluster.UNIT_YD);
+        if (!shortUnit || m <= 0 || m > SMOOTH_MAX_M || v < 1.0f || shownDist <= 0f) {
             smBaseMeters = -1;
             return;
         }
-        if (smMinMeters < 0 || m - smMinMeters > 15) smMinMeters = m;
-        else smMinMeters = Math.min(smMinMeters, m);
-        smBaseMeters = m;
+        float scale = unitsPerMeter(clusterUnit);
+        smBaseMeters = clampedMeters >= 0 ? clampedMeters : m;
+        smBaseDist = shownDist;
+        smFloorDist = Math.max(0f, (m - v * 1.25f) * scale);
+        smClusterUnit = clusterUnit;
         smSpeed = v;
         smAt = t;
         handler.postDelayed(smooth, SMOOTH_MS);
@@ -648,17 +683,29 @@ final class CpTurns {
         if (dt > SMOOTH_STALE_MS) return;
         Update u = updates.get(smCompId);
         if (u == null || u.state == 0 || u.list == null || u.list.length == 0 || u.list[0] != smManeuverIdx) return;
-        int est = Math.max(0, Math.round(smBaseMeters - smSpeed * dt / 1000f));
-        if (smMinMeters >= 0) est = Math.min(est, smMinMeters);
-        smMinMeters = est;
-        int saved = u.distNext;
-        u.distNext = est;
-        try {
-            turn(smCompId, u, true);
-        } finally {
-            u.distNext = saved;
+        float scale = unitsPerMeter(smClusterUnit);
+        float rawEstDist = Math.max(smFloorDist, smBaseDist - (smSpeed * scale) * dt / 1000f);
+        float estDist = quantizeShortSmooth(rawEstDist, smClusterUnit);
+        int estMeters = Math.max(0, Math.round(smBaseMeters - smSpeed * dt / 1000f));
+        if (u.minRawMeters >= 0 && estMeters > u.minRawMeters) estMeters = u.minRawMeters;
+        if (u.minShownDist >= 0f && u.minShownUnit == smClusterUnit && estDist > u.minShownDist) estDist = u.minShownDist;
+
+        int prevBar = u.minRawMeters >= 0 ? Math.max(1, Math.min(9, u.minRawMeters * 10 / GUIDE_WINDOW)) : -1;
+        int curBar = Math.max(1, Math.min(9, estMeters * 10 / GUIDE_WINDOW));
+        boolean barMoved = u.minRawMeters >= 0
+                && (prevBar != curBar || (u.minRawMeters >= 20 && estMeters < 20));
+        boolean distMoved = u.minShownDist < 0f || estDist < u.minShownDist;
+        if (distMoved || barMoved) {
+            int saved = u.distNext;
+            u.distNext = estMeters;
+            smEstDist = estDist;
+            try {
+                turn(smCompId, u, true);
+            } finally {
+                u.distNext = saved;
+            }
         }
-        if (est > 0) handler.postDelayed(smooth, SMOOTH_MS);
+        if (estMeters > 0 && estDist > 0f) handler.postDelayed(smooth, SMOOTH_MS);
     }
 
     static int iap2UnitToCluster(int nextUnits) {
@@ -1188,10 +1235,65 @@ final class CpTurns {
         int[] list;
         boolean visible, lanesShown, supports;
 
+        // Per-maneuver monotonic distance floor
+        int monoManeuverIdx = -1, monoManeuverType = -1;
+        int minRawMeters = -1, minShownRank = -1, minShownUnit = -1;
+        float minShownDist = -1f;
+
         Update(int id, Iap2NotiMsg msg) {
             if (msg == null || id <= 0) return;
             clear();
             read(id, msg);
+        }
+
+        void resetMonotonic(int idx, int type) {
+            monoManeuverIdx = idx;
+            monoManeuverType = type;
+            minRawMeters = -1;
+            minShownRank = -1;
+            minShownUnit = -1;
+            minShownDist = -1f;
+        }
+
+        float[] applyMonotonic(float dist, int unit, int rawM, int wrongWayThreshold) {
+            if (dist < 0f) return new float[] { dist, unit };
+            int rank = (unit == Cluster.UNIT_MI || unit == Cluster.UNIT_KM) ? 0 : (unit >= 0 && unit <= 4 ? 1 : -1);
+            boolean metric = (unit == Cluster.UNIT_M || unit == Cluster.UNIT_KM);
+            boolean prevMetric = (minShownUnit == Cluster.UNIT_M || minShownUnit == Cluster.UNIT_KM);
+            if (minShownUnit >= 0 && metric != prevMetric) {
+                // Distance unit system switched (metric <-> imperial): reset floor
+                minRawMeters = -1;
+                minShownRank = -1;
+                minShownDist = -1f;
+            }
+            if (rawM >= 0) {
+                if (minRawMeters >= 0 && rawM - minRawMeters > wrongWayThreshold) {
+                    minRawMeters = rawM;
+                    minShownRank = -1;
+                    minShownDist = -1f;
+                } else if (minRawMeters < 0 || rawM < minRawMeters) {
+                    minRawMeters = rawM;
+                }
+            }
+            if (rank < 0) return new float[] { dist, unit };
+            if (minShownRank == 1 && rank == 0) {
+                return new float[] { minShownDist, minShownUnit };
+            }
+            if (rank > minShownRank || minShownDist < 0f) {
+                minShownRank = rank;
+                minShownUnit = unit;
+                minShownDist = dist;
+            } else if (unit == minShownUnit) {
+                if (dist > minShownDist) {
+                    dist = minShownDist;
+                } else {
+                    minShownDist = dist;
+                }
+            } else {
+                minShownUnit = unit;
+                minShownDist = dist;
+            }
+            return new float[] { dist, unit };
         }
 
         void clear() {
@@ -1210,6 +1312,7 @@ final class CpTurns {
             nextUnits = 0;
             hasNextUnits = false;
             waitingManeuver = false;
+            resetMonotonic(-1, -1);
             list = null;
             count = 0;
             visible = false;

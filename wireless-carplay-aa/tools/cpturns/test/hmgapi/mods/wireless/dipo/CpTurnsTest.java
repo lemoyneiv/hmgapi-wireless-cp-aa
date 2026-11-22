@@ -418,7 +418,7 @@ public final class CpTurnsTest {
         check("3-arrow composite lane: parts {47, 53, 49} and per-part color mask 62",
                 enc3[0] == 62 && enc3[1] == 47 && enc3[2] == 53 && enc3[3] == 49);
 
-        // 5. Smooth 250 ms approaching-turn countdown on CarPlay
+        // 5. Smooth 250 ms short-unit (UNIT_M) approaching-turn countdown on CarPlay
         CpTurns.testNow = 20000L;
         Handler sh = new Handler();
         CpTurns sm = new CpTurns(new Context(), c, null, sh);
@@ -433,6 +433,52 @@ public final class CpTurnsTest {
         sm.smooth.run();
         expect("CarPlay smooth t=500ms: glides down to 270 m, bar drops to 50",
                 "road [Cedar St]", "tbt 13 0 90.0 270.0 0 0 0 50 0", "2c 0 0 270 0 0 0 0 0 0");
+
+        // 6. CarPlay .4 -> .3 -> .2 -> .1 -> ft anti-oscillation + UNIT_FT 10-ft glide + red-light clamp
+        sm.maneuver(maneuver(1, 1, 0, 0, -90, "Maple Ave", 800));
+        CpTurns.testNow = 30000L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(610), 11, STR, s("0.4"), 12, ENUM, i(1), 13, U16, i(1)));
+        c.calls.clear();
+        CpTurns.testNow = 31000L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(520), 11, STR, s("0.3"), 12, ENUM, i(1)));
+        expect("CarPlay drops cleanly from 0.4 mi to 0.3 mi",
+                "road [Maple Ave]", "tbt 70 0 0.0 0.3 0 0 2 0 0", "2c 2 3 0 0 0 0 0 0 0");
+        check("CarPlay UNIT_MI suppresses 250 ms sub-tenth interpolation (no .4 <-> .3 flip)",
+                !sh.scheduled.containsKey(sm.smooth));
+
+        CpTurns.testNow = 32000L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(570), 11, STR, s("0.4"), 12, ENUM, i(1)));
+        expect("CarPlay .4/.3 boundary wobble stays clamped at 0.3 mi",
+                "road [Maple Ave]", "tbt 70 0 0.0 0.3 0 0 2 0 0", "2c 2 3 0 0 0 0 0 0 0");
+
+        // nextStr-only wobble (without item 10 distNext): 0.2 mi -> 0.3 mi wobble stays 0.2 mi!
+        CpTurns.testNow = 33000L;
+        sm.routeGuidance(msg(0, U16, i(1), 11, STR, s("0.2"), 12, ENUM, i(1)));
+        expect("CarPlay nextStr-only 0.2 mi enters GUIDE_WINDOW (TURN 270, bar 70)",
+                "road [Maple Ave]", "tbt 13 0 270.0 0.2 0 0 2 70 0", "2c 2 2 0 0 0 0 0 0 0");
+        CpTurns.testNow = 34000L;
+        sm.routeGuidance(msg(0, U16, i(1), 11, STR, s("0.3"), 12, ENUM, i(1)));
+        expect("CarPlay nextStr-only 0.3 mi wobble stays clamped at 0.2 mi, bar 70",
+                "road [Maple Ave]", "tbt 13 0 270.0 0.2 0 0 2 70 0", "2c 2 2 0 0 0 0 0 0 0");
+
+        // Transition into feet: 400 ft -> 340 ft -> 250 ms glide in 10-ft steps -> red-light clamp
+        CpTurns.testNow = 35000L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(122), 11, STR, s("400"), 12, ENUM, i(4)));
+        c.calls.clear();
+        CpTurns.testNow = 36000L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(102), 11, STR, s("340"), 12, ENUM, i(4)));
+        c.calls.clear();
+        check("CarPlay UNIT_FT schedules 250 ms smooth countdown", sh.scheduled.containsKey(sm.smooth));
+        CpTurns.testNow = 36500L;
+        sm.smooth.run();
+        expect("CarPlay UNIT_FT glides down in 10-ft steps to 310 ft",
+                "road [Maple Ave]", "tbt 13 0 270.0 310.0 0 0 3 20 0", "2c 3 0 310 0 0 0 0 0 0");
+        CpTurns.testNow = 37500L;
+        sm.routeGuidance(msg(0, U16, i(1), 10, U32, i(105), 11, STR, s("350"), 12, ENUM, i(4)));
+        expect("CarPlay red-light GPS upward wobble (350 ft after 310 ft) stays clamped at 310 ft",
+                "road [Maple Ave]", "tbt 13 0 270.0 310.0 0 0 3 20 0", "2c 3 0 310 0 0 0 0 0 0");
+        check("CarPlay stationary at red light pauses smooth countdown", !sh.scheduled.containsKey(sm.smooth));
+
         CpTurns.testNow = -1;
     }
 }

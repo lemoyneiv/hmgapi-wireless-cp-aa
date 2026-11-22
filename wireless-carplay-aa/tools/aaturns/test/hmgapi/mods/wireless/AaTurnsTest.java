@@ -273,7 +273,7 @@ public final class AaTurnsTest {
         s.nextTurnDistance(1200, 90, 700, MILES_P1);
         expect("standard: 0.7 mi out: the icon (70 left), bar off", "tbt 70 65535 270.0 0.7 0 0 2 0 0", "2c 2 7 0 0 0 0 0 0 0");
         s.nextTurnDistance(440, 40, 273, MILES_P1);
-        expect("standard: 440 m: TURN (13) 270, bar 90; HUD keeps its icon", "tbt 13 0 270.0 0.273 0 0 2 90 0", "2c 2 3 0 0 0 0 0 0 0");
+        expect("standard: 440 m: TURN (13) 270, tenth-rounded 0.3 mi, bar 90; HUD keeps its icon", "tbt 13 0 270.0 0.3 0 0 2 90 0", "2c 2 3 0 0 0 0 0 0 0");
         Intent bar90 = sCtx.broadcasts.get(sCtx.broadcasts.size() - 1);
         check("PHONE_TBT broadcast carries trap bar 90", bar90.getBooleanExtra("active", false) && bar90.getIntExtra("bar", -1) == 90);
         s.nextTurnDistance(274, 25, 900000, FEET);
@@ -344,14 +344,14 @@ public final class AaTurnsTest {
         check("rerouting again while it shows: no second wait", rh.delayed == null);
         rr.nextTurn("Oak Ave", LEFT, TURN, -1, 0);
         expect("the new route's first turn replaces it with the pre-sent reroute distance",
-                "road [Oak Ave]", "tbt 13 0 270.0 0.186 0 0 2 60 0",
+                "road [Oak Ave]", "tbt 13 0 270.0 0.2 0 0 2 60 0",
                 "hud f201460000" + utf16("Oak Ave"), "2c 2 2 0 0 0 0 0 0 0");
         rr.status(3);
         rh.delayed.run();
         c.calls.clear();
         rr.status(1);
         expect("reroute over with the same route: the turn comes back",
-                "tbt 13 0 270.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+                "tbt 13 0 270.0 0.2 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
         Handler oh = new Handler();
         AaTurns off = new AaTurns(new Context(), c, oh);
         off.standardTurns = false;
@@ -362,7 +362,7 @@ public final class AaTurnsTest {
         // ---- 5. 0x8006 AaNavState exact maneuvers, charging stops, roundabouts & lane side streets
         testExactManeuversAndLanes();
 
-        // ---- 6. Smooth 250 ms approaching-turn countdown & compass quantization
+        // ---- 6. Anti-oscillation (.4->.3->.2->.1->ft), short-unit 250 ms countdown & compass quantization
         testSmoothAndCompass();
 
         System.exit(fail);
@@ -387,7 +387,7 @@ public final class AaTurnsTest {
                 "tbt 174 65535 0.0 0.5 0 0 2 0 0", "2c 2 5 0 0 0 0 0 0 0");
         x.nextTurnDistance(200, 10, 124, MILES_P1);
         expect("0x8006 KEEP_LEFT near: FORK_2 (25) 270 instead of intersection slight-left TURN",
-                "tbt 25 0 270.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+                "tbt 25 0 270.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
 
         // EV_AHEAD_END with 0 clears stale 2nd-step HUD icon when rawNextIcon is also cleared
         W singleStep = new W().m(1, step(AaNavState.M_OFF_RAMP_SLIGHT_RIGHT, -1, -1, "Exit 12"));
@@ -397,7 +397,7 @@ public final class AaTurnsTest {
         expect("0x8006 OFF_RAMP_SLIGHT_RIGHT recovers RIGHT side when legacy side is UNSPECIFIED -> EXIT_RIGHT (17)",
                 "road [Exit 12]", "tbt 81 65535 30.0 -1.0 0 0 0 254 -2",
                 "hud f201510000" + utf16("Exit 12"),
-                "tbt 17 0 90.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+                "tbt 17 0 90.0 0.2 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
 
         // ON_RAMP_SHARP_LEFT -> 225 deg near; MERGE_RIGHT -> 66 (45 deg)
         x.nextTurn(new W().m(1, step(AaNavState.M_ON_RAMP_SHARP_LEFT, -1, -1, "US-101")).dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
@@ -414,7 +414,7 @@ public final class AaTurnsTest {
         expect("0x8006 MERGE_RIGHT: icon 66 on HUD, TURN 45 near",
                 "road [I-90]", "tbt 66 65535 45.0 -1.0 0 0 0 254 -2",
                 "hud f201420000" + utf16("I-90"),
-                "tbt 13 0 45.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+                "tbt 13 0 45.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
 
         // Clockwise (LHT) roundabout + "At the roundabout, " prefix stripping + exit preservation
         x.nextTurn(new W().m(1, step(AaNavState.M_ROUNDABOUT_ENTER_AND_EXIT_CW_WITH_ANGLE, 2, 90, "High St")).dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
@@ -423,7 +423,7 @@ public final class AaTurnsTest {
         expect("0x8006 CW roundabout: prefix stripped, clockwise icon 195 (0xc3) on HUD, TYPE_ROUNDABOUT_LEFT (33) near",
                 "road [Take the 2nd exit]", "tbt 195 65535 90.0 -1.0 0 0 0 254 -2",
                 "hud f201c30000" + utf16("Take the 2nd exit"),
-                "tbt 33 0 90.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+                "tbt 33 0 90.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
         x.nextTurn("High St", UNSPECIFIED, 12, -1, 0);
         x.nextTurnDistance(40, 4, 131000, FEET);
         expect("CW roundabout preserved into ROUNDABOUT_EXIT: stays TYPE_ROUNDABOUT_LEFT (33) 90",
@@ -474,46 +474,107 @@ public final class AaTurnsTest {
                         && AaTurns.clusterCompassDeg(270) == 90f
                         && AaTurns.clusterCompassDeg(30) == 337.5f);
 
-        AaTurns.testNow = 10000L;
+        AaTurns.testNow = 1000L;
         Handler sh = new Handler();
         AaTurns sm = new AaTurns(new Context(), c, sh);
         sm.status(1);
         sm.nextTurn("Market St", 2, 4, -1, 0);
         c.calls.clear();
 
-        // First sample at t=10000ms: 300 m, 15 s -> initial velocity 20 m/s
-        sm.nextTurnDistance(300, 15, 186, 5);
-        expect("smooth t=0: 300 m (0.186 mi), bar 60", "tbt 13 0 90.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
-        check("smooth 250 ms tick scheduled", sh.scheduled.containsKey(sm.smooth));
+        // Part A: .4 -> .3 -> .2 -> .1 -> ft anti-oscillation regression (no 250 ms sub-tenth MI ticks, monotonic clamp)
+        sm.nextTurnDistance(610, 25, 400, 5); // real AA: 610 m (0.379 mi) rounded to "0.4"
+        expect("0.4 mi (610 m): steady 0.4 mi", "tbt 67 65535 90.0 0.4 0 0 2 0 0", "2c 2 4 0 0 0 0 0 0 0");
+        check("UNIT_MI does not schedule 250 ms sub-tenth interpolation (prevents .4 <-> .3 flip)",
+                !sh.scheduled.containsKey(sm.smooth));
 
-        // 500 ms later: est = 300 - 20*0.5 = 290 m (0.180 mi)
+        AaTurns.testNow = 2000L;
+        sm.nextTurnDistance(520, 21, 300, 5);
+        expect("drops cleanly to 0.3 mi", "tbt 67 65535 90.0 0.3 0 0 2 0 0", "2c 2 3 0 0 0 0 0 0 0");
+
+        AaTurns.testNow = 3000L;
+        sm.nextTurnDistance(570, 23, 400, 5); // GPS boundary wobble back across .35 mi
+        expect("wobble back toward 0.4 mi is clamped steady at 0.3 mi",
+                "tbt 67 65535 90.0 0.3 0 0 2 0 0", "2c 2 3 0 0 0 0 0 0 0");
+
+        AaTurns.testNow = 4000L;
+        sm.nextTurnDistance(380, 16, 200, 5); // enters GUIDE_WINDOW at 0.2 mi, bar 80
+        expect("0.2 mi inside GUIDE_WINDOW: TURN 90, bar 80",
+                "tbt 13 0 90.0 0.2 0 0 2 80 0", "2c 2 2 0 0 0 0 0 0 0");
+        check("UNIT_MI inside GUIDE_WINDOW still suppresses 250 ms sub-tenth interpolation",
+                !sh.scheduled.containsKey(sm.smooth));
+
+        AaTurns.testNow = 5000L;
+        sm.nextTurnDistance(415, 18, 300, 5); // wobble toward 0.3 mi / bar 90
+        expect("wobble inside GUIDE_WINDOW stays clamped at 0.2 mi and bar 80",
+                "tbt 13 0 90.0 0.2 0 0 2 80 0", "2c 2 2 0 0 0 0 0 0 0");
+
+        AaTurns.testNow = 6000L;
+        sm.nextTurnDistance(220, 10, 100, 5);
+        expect("drops cleanly to 0.1 mi, bar 40",
+                "tbt 13 0 90.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+
+        AaTurns.testNow = 7000L;
+        sm.nextTurnDistance(250, 11, 200, 5); // .2/.1 boundary wobble
+        expect(".2/.1 wobble stays clamped at 0.1 mi, bar 40",
+                "tbt 13 0 90.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+
+        AaTurns.testNow = 8000L;
+        sm.nextTurnDistance(150, 8, 500000, 6); // crosses into UNIT_FT (500 ft)
+        expect("transitions into 500 ft, bar 30",
+                "tbt 13 0 90.0 500.0 0 0 3 30 0", "2c 3 0 500 0 0 0 0 0 0");
+        check("UNIT_FT inside GUIDE_WINDOW schedules 250 ms smooth countdown",
+                sh.scheduled.containsKey(sm.smooth));
+
+        AaTurns.testNow = 9000L;
+        sm.nextTurnDistance(162, 9, 100, 5); // boundary bounce back to 0.1 mi
+        expect("FT -> MI bounce stays locked in feet (500.0 ft, bar 30)",
+                "tbt 13 0 90.0 500.0 0 0 3 30 0", "2c 3 0 500 0 0 0 0 0 0");
+
+        // Part B: Short-unit (UNIT_FT) 250 ms glide in 10-ft steps, seconds==0 continuation, red-light clamp & wrong-way unlock
+        sm.nextTurn("Oak St", 2, 4, -1, 0);
+        c.calls.clear();
+
+        AaTurns.testNow = 10000L;
+        sm.nextTurnDistance(122, 6, 400000, 6); // 122 m (400 ft), 6 s -> v = 20.33 m/s
+        expect("short-unit t=0: 400 ft, bar 20",
+                "tbt 13 0 90.0 400.0 0 0 3 20 0", "2c 3 0 400 0 0 0 0 0 0");
+        check("short-unit smooth 250 ms tick scheduled", sh.scheduled.containsKey(sm.smooth));
+
         AaTurns.testNow = 10500L;
         sm.smooth.run();
-        expect("smooth t=500ms: glides down to 290 m (0.18 mi)", "tbt 13 0 90.0 0.18 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+        expect("short-unit t=500ms: glides down in 10-ft steps to 370 ft",
+                "tbt 13 0 90.0 370.0 0 0 3 20 0", "2c 3 0 370 0 0 0 0 0 0");
 
-        // Second raw report at t=11000ms: 280 m, seconds=0 (AA hits 0s early) -> observed v = 20 m/s continues!
+        // Second raw report at t=11000ms: 98 m (320 ft), seconds=0 (AA hits 0s early) -> observed v = 24 m/s continues!
         AaTurns.testNow = 11000L;
-        sm.nextTurnDistance(280, 0, 174, 5);
+        sm.nextTurnDistance(98, 0, 320000, 6);
         c.calls.clear();
         AaTurns.testNow = 11500L;
         sm.smooth.run();
-        expect("smooth continues from observed velocity even when seconds == 0 (270 m -> 0.167 mi, bar 50)",
-                "tbt 13 0 90.0 0.167 0 0 2 50 0", "2c 2 2 0 0 0 0 0 0 0");
+        expect("smooth continues from observed velocity when seconds == 0 (280 ft, bar drops to 10)",
+                "tbt 13 0 90.0 280.0 0 0 3 10 0", "2c 3 0 280 0 0 0 0 0 0");
 
-        // Red-light stop: at t=12500ms phone still reports 280 m (dm <= 0) -> v = 0, no rubber-band or drift!
+        // Red-light stop with slight GPS upward drift (100 m / 330 ft): pauses smooth AND clamps steady at 280 ft!
         AaTurns.testNow = 12500L;
-        sm.nextTurnDistance(280, 14, 174, 5);
-        c.calls.clear();
+        sm.nextTurnDistance(100, 5, 330000, 6);
+        expect("red-light stop with GPS drift (330 ft after 280 ft): clamped steady at 280 ft, bar 10",
+                "tbt 13 0 90.0 280.0 0 0 3 10 0", "2c 3 0 280 0 0 0 0 0 0");
         check("stationary at red light (dm <= 0): smooth countdown pauses instead of drifting",
                 !sh.scheduled.containsKey(sm.smooth));
 
-        // Resume motion at t=13500ms (260 m -> v = 20 m/s), then phone goes silent past 1750 ms -> holds!
+        // Resume motion at t=13500ms (80 m / 260 ft -> v = 20 m/s), then phone goes silent past 1750 ms -> holds!
         AaTurns.testNow = 13500L;
-        sm.nextTurnDistance(260, 13, 161, 5);
+        sm.nextTurnDistance(80, 4, 260000, 6);
         c.calls.clear();
         AaTurns.testNow = 15500L; // dt = 2000 ms > SMOOTH_STALE_MS (1750 ms)
         sm.smooth.run();
         expect("phone silent > 1750 ms: holds last displayed distance without running past turn");
+
+        // Genuine wrong-way travel (+120 m > 60 m) unlocks monotonic clamp cleanly
+        AaTurns.testNow = 16500L;
+        sm.nextTurnDistance(200, 10, 100, 5);
+        expect("genuine wrong-way travel (> 60 m) unlocks back to 0.1 mi, bar 40",
+                "tbt 13 0 90.0 0.1 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
 
         AaTurns.testNow = -1;
     }

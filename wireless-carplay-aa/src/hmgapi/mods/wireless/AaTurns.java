@@ -62,8 +62,9 @@ final class AaTurns {
     static final float COMPASS_STEP = 22.5f;
     private static final String ROUNDABOUT_PREFIX = "At the roundabout, ";
 
-    // Smooth approaching-turn countdown parameters
-    static final int SMOOTH_MAX_M = 2 * GUIDE_WINDOW;
+    // Smooth approaching-turn countdown & monotonic distance guard parameters
+    static final int SMOOTH_MAX_M = GUIDE_WINDOW;
+    static final int WRONG_WAY_RESET_M = 60;
     static final long SMOOTH_MS = 250, SMOOTH_STALE_MS = 1750;
     static final long PHONE_HEARTBEAT_MS = 2000;
     static final long UNIT_TICK_MS = 1000;
@@ -144,13 +145,15 @@ final class AaTurns {
     final int[] aheadMeters = new int[3], aheadUnit = new int[3], aheadE3 = new int[3];
     final boolean[] aheadOk = new boolean[3];
 
-    // Smooth countdown state for the current maneuver
+    // Monotonic & smooth countdown state for the current maneuver
     boolean distanceReadyForNext;
+    int minRawMeters = -1, minShownRank = -1, minShownUnit = -1, minShownUsm = -2;
+    float minShownDist = -1f;
     int prevRawMeters = -1;
     long prevRawAt = -10000L;
-    int smBaseMeters = -1, smMinMeters = -1, smUnit;
+    int smBaseMeters = -1, smClusterUnit = -1;
+    float smBaseDist = -1f, smFloorDist = 0f, smSpeed;
     long smAt;
-    float smSpeed;
 
     // Live car heading for compass restoration & NaviBridge trap-bar state
     private BroadcastReceiver headingReceiver;
@@ -324,6 +327,7 @@ final class AaTurns {
                 meters = -1;
                 unit = 0;
                 hasDistance = false;
+                resetMonotonic();
             }
             resetSmooth();
             if (pendingLaneArrows != null && now() - pendingLaneAt <= 500L) {
@@ -570,15 +574,39 @@ final class AaTurns {
         applyExact();
     }
 
-    // ---- Smooth 250 ms approaching-turn countdown
+    // ---- Monotonic distance guard & smooth 250 ms short-unit countdown
+
+    private void resetMonotonic() {
+        minRawMeters = -1;
+        minShownRank = -1;
+        minShownUnit = -1;
+        minShownUsm = -2;
+        minShownDist = -1f;
+    }
 
     private void resetSmooth() {
         handler.removeCallbacks(smooth);
         prevRawMeters = -1;
         prevRawAt = -10000L;
         smBaseMeters = -1;
-        smMinMeters = -1;
+        smBaseDist = -1f;
+        smFloorDist = 0f;
+        smClusterUnit = -1;
         smSpeed = 0f;
+    }
+
+    static float unitsPerMeter(int clusterUnit) {
+        if (clusterUnit == Cluster.UNIT_FT) return 3.28084f;
+        if (clusterUnit == Cluster.UNIT_YD) return 1.09361f;
+        return 1.0f;
+    }
+
+    static float quantizeShortSmooth(float d, int clusterUnit) {
+        if (d <= 0f) return 0f;
+        if (clusterUnit == Cluster.UNIT_FT) {
+            return d < 20f ? Math.round(d) : Math.round(d / 10f) * 10f;
+        }
+        return d < 10f ? Math.round(d) : Math.round(d / 5f) * 5f;
     }
 
     void smoothFrom(int m, int seconds, int u) {
@@ -599,14 +627,19 @@ final class AaTurns {
         prevRawMeters = m;
         prevRawAt = t;
 
-        if (m <= 0 || m > SMOOTH_MAX_M || v < 1.0f) {
+        // Only run 250 ms interpolation in short units (ft/m/yd) inside GUIDE_WINDOW.
+        // In miles/km (0.4, 0.3, 0.2, 0.1), the cluster only displays tenths and sub-tenth
+        // interpolation fights the phone's rounded tenths due to cluster truncation.
+        boolean shortUnit = (unit == Cluster.UNIT_FT || unit == Cluster.UNIT_M || unit == Cluster.UNIT_YD);
+        if (!shortUnit || m <= 0 || m > SMOOTH_MAX_M || v < 1.0f || distance <= 0f) {
             smBaseMeters = -1;
             return;
         }
-        if (smMinMeters < 0 || m - smMinMeters > 15) smMinMeters = m;
-        else smMinMeters = Math.min(smMinMeters, m);
-        smBaseMeters = m;
-        smUnit = u;
+        float scale = unitsPerMeter(unit);
+        smBaseMeters = this.meters >= 0 ? this.meters : m;
+        smBaseDist = this.distance;
+        smFloorDist = Math.max(0f, (m - v * 1.25f) * scale);
+        smClusterUnit = this.unit;
         smSpeed = v;
         smAt = t;
         handler.postDelayed(smooth, SMOOTH_MS);
@@ -616,29 +649,25 @@ final class AaTurns {
         if (smBaseMeters < 0 || !navLive || rerouteShown || !hasTurn) return;
         long dt = now() - smAt;
         if (dt > SMOOTH_STALE_MS) return;   // Phone went quiet: hold the last displayed distance
-        int est = Math.max(0, Math.round(smBaseMeters - smSpeed * dt / 1000f));
-        if (smMinMeters >= 0) est = Math.min(est, smMinMeters);
-        smMinMeters = est;
+        float scale = unitsPerMeter(smClusterUnit);
+        float rawEstDist = Math.max(smFloorDist, smBaseDist - (smSpeed * scale) * dt / 1000f);
+        float estDist = quantizeShortSmooth(rawEstDist, smClusterUnit);
+        int estMeters = Math.max(0, Math.round(smBaseMeters - smSpeed * dt / 1000f));
 
         float beforeDist = distance;
         int beforeMeters = meters;
-        setDistance(est, e3For(est, smUnit), smUnit, true);
-        boolean barMoved = standardTurns && (beforeMeters * 10 / GUIDE_WINDOW) != (est * 10 / GUIDE_WINDOW);
-        if (distance != beforeDist || barMoved) {
+        distance = estDist;
+        unit = smClusterUnit;
+        applyMonotonic(estMeters, distanceUnit());
+        int prevBar = Math.max(1, Math.min(9, beforeMeters * 10 / GUIDE_WINDOW));
+        int curBar = Math.max(1, Math.min(9, meters * 10 / GUIDE_WINDOW));
+        boolean barOrArrivedMoved = standardTurns && beforeMeters >= 0
+                && (prevBar != curBar || (beforeMeters >= 20 && meters < 20));
+        if (distance != beforeDist || barOrArrivedMoved) {
             refreshTurnType();
             sendTurn();
         }
-        if (est > 0) handler.postDelayed(smooth, SMOOTH_MS);
-    }
-
-    static int e3For(int m, int u) {
-        switch (u) {
-            case FEET: return m * 3281;
-            case YARDS: return m * 1094;
-            case MILES: case MILES_P1: return m * 1000 / 1609;
-            case KILOMETERS: case KILOMETERS_P1: return m;
-            default: return m * 1000;
-        }
+        if (meters > 0 && distance > 0f) handler.postDelayed(smooth, SMOOTH_MS);
     }
 
     void status(int s) {
@@ -678,6 +707,8 @@ final class AaTurns {
     void reroute() {
         if (!standardTurns || rerouting) return;
         rerouting = true;
+        resetSmooth();
+        resetMonotonic();
         handler.removeCallbacks(rerouteShow);
         handler.postDelayed(rerouteShow, REROUTE_SHOW_MS);
     }
@@ -703,6 +734,7 @@ final class AaTurns {
     /** Resets current route/maneuver state (native focus takeover or route end). */
     void stop() {
         resetSmooth();
+        resetMonotonic();
         hasTurn = false;
         hasDistance = false;
         distanceReadyForNext = false;
@@ -832,7 +864,7 @@ final class AaTurns {
             } else if (usm == Car.DISTANCE_MILES) {
                 if (meters >= 161) {
                     if (u < MILES || interpolated) {
-                        e3 = meters * 1000 / 1609;
+                        e3 = Math.round(meters * 10f / 1609.344f) * 100;
                         u = MILES_P1;
                     }
                 } else if ((u != FEET && u != YARDS) || interpolated) {
@@ -860,6 +892,56 @@ final class AaTurns {
             unit = Cluster.UNIT_YD;
         } else {
             unit = 15;
+        }
+        if (distance >= 0f && (unit == Cluster.UNIT_MI || unit == Cluster.UNIT_KM)) {
+            distance = Math.round(distance * 10f) / 10f;
+        }
+        applyMonotonic(meters, usm);
+    }
+
+    /**
+     * Prevents displayed distance and countdown bar from bouncing upward within the same maneuver
+     * (e.g. .4 <-> .3, .3 <-> .2, .2 <-> .1 mi, or 180 -> 200 ft at a stop), while unlocking if
+     * the owner/app switches metric <-> imperial units or the vehicle travels > 60 m away from the turn.
+     */
+    private void applyMonotonic(int rawM, int usm) {
+        if (distance < 0f) return;
+        boolean metric = (unit == Cluster.UNIT_M || unit == Cluster.UNIT_KM);
+        boolean prevMetric = (minShownUnit == Cluster.UNIT_M || minShownUnit == Cluster.UNIT_KM);
+        if ((minShownUsm != -2 && usm != minShownUsm) || (minShownUnit >= 0 && metric != prevMetric)) {
+            resetMonotonic();
+        }
+        minShownUsm = usm;
+        if (rawM >= 0) {
+            if (minRawMeters >= 0 && rawM - minRawMeters > WRONG_WAY_RESET_M) {
+                minRawMeters = rawM;
+                minShownRank = -1;
+                minShownDist = -1f;
+            } else if (minRawMeters < 0 || rawM < minRawMeters) {
+                minRawMeters = rawM;
+            }
+            this.meters = minRawMeters;
+        }
+        int rank = (unit == Cluster.UNIT_MI || unit == Cluster.UNIT_KM) ? 0 : (unit >= 0 && unit <= 4 ? 1 : -1);
+        if (rank < 0) return;
+        if (minShownRank == 1 && rank == 0) {
+            unit = minShownUnit;
+            distance = minShownDist;
+            return;
+        }
+        if (rank > minShownRank || minShownDist < 0f) {
+            minShownRank = rank;
+            minShownUnit = unit;
+            minShownDist = distance;
+        } else if (unit == minShownUnit) {
+            if (distance > minShownDist) {
+                distance = minShownDist;
+            } else {
+                minShownDist = distance;
+            }
+        } else {
+            minShownUnit = unit;
+            minShownDist = distance;
         }
     }
 

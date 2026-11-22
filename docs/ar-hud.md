@@ -52,18 +52,25 @@ The same setting puts CarPlay's turns in the car's own format (`CpTurns.standard
 | roundabout exit icons (96-107 RHT, 192-203 LHT) | `EXIT_ROUNDABOUT_TRS_RIGHT` 32 (33 for left-hand traffic) with the icon's direction |
 | arrival icons 112 / 113 / 114 | the icon, no bar; `ARRIVED` 3 within 20 m or in state 2 |
 
-### Smooth 250 ms approaching-turn glide
+### Steady tenths and smooth 250 ms short-unit glide
 
-The AR HUD arrow glides toward the intersection as the reported distance drops. Because
-phones report turn distances roughly once per second, `AaTurns` and `CpTurns` interpolate
-distance every 250 ms within `SMOOTH_MAX_M` (914 m) from observed vehicle velocity:
+Gen5W's `ClusterService` truncates `UNIT_MI` / `UNIT_KM` floats to integer tenths via
+`(int)(distance * 10f)`, whereas Android Auto and CarPlay round their display strings to
+the nearest tenth (`0.35..0.44 mi` -> `"0.4"`). To prevent `.4 <-> .3`, `.3 <-> .2`, and
+`.2 <-> .1` oscillation while keeping a smooth final approach:
 
-- If consecutive raw distance samples do not decrease (e.g. stopped at a red light),
-  observed velocity drops to 0 immediately so the distance never rubber-bands or drifts.
-- Under Android Auto, observed velocity continues smoothly even after `time_to_step`
-  reaches `0 s` before the intersection.
-- If the phone goes silent for more than 1.75 s, interpolation holds the last displayed
-  distance rather than running past the turn.
+- **Exact tenths & monotonic clamping:** `AaTurns` and `CpTurns` round `UNIT_MI` and
+  `UNIT_KM` values to exact tenths and clamp per-maneuver distance, countdown bar, and
+  `mi -> ft` / `km -> m` transitions monotonically downward (resetting on maneuver change,
+  reroute, metric/imperial unit switch, or `> 60 m` wrong-way travel).
+- **Short-unit 250 ms glide:** Within `GUIDE_WINDOW` (457 m) once the display is in short
+  units (`ft`, `m`, `yd`), `AaTurns` and `CpTurns` interpolate every 250 ms from observed
+  vehicle velocity anchored to the displayed distance (`10 ft` steps in feet, `5` in
+  meters/yards).
+- **Stationary & silence guards:** If consecutive raw samples do not decrease (e.g.
+  stopped at a red light), observed velocity drops to 0 immediately; under Android Auto,
+  observed velocity continues smoothly after `time_to_step` hits `0 s`; and if the phone
+  goes silent for more than 1.75 s, interpolation holds the last displayed distance.
 
 ## The distance bar and the speed limit (`NaviBridge`)
 
