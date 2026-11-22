@@ -19,6 +19,7 @@ The firewall workarounds are off by default; the other settings below are on:
 | Setting | What |
 |---|---|
 | Turn-by-turn on the cluster and HUD | CarPlay directions; Android Auto directions only with a verified native recipe |
+| Enhanced cluster & AR HUD turn graphics | Native 3D cluster scenes, AR HUD turn animations, intersection side streets, smooth 250 ms approach countdown, trap-frame countdown bar, and clean compass restoration (turn off for basic projection icons) |
 | Wireless CarPlay | The Bluetooth bridge and Wi-Fi sessions CarPlay needs |
 | Shared CarPlay identity | A typed API other mods use to contribute vehicle identity without competing native patches |
 | CarPlay music and Siri over Wi-Fi | AAC and Opus audio (`libleafiaaac.so`, using the head unit's own codecs) |

@@ -14,7 +14,8 @@ T="--target=armv7a-linux-androideabi -mthumb -march=armv7-a -mfloat-abi=softfp"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 echo 'void *calloc(unsigned a, unsigned b) { return 0; } void free(void *p) {} void *malloc(unsigned n) { return 0; }
-void *memcpy(void *d, const void *s, unsigned n) { return d; } void *memset(void *d, int c, unsigned n) { return d; }' > "$W/c.c"
+void *memcpy(void *d, const void *s, unsigned n) { return d; } void *memset(void *d, int c, unsigned n) { return d; }
+int sched_yield(void) { return 0; }' > "$W/c.c"
 echo 'void *dlopen(const char *f, int m) { return 0; } void *dlsym(void *h, const char *s) { return 0; }' > "$W/dl.c"
 echo 'int __android_log_print(int p, const char *t, const char *f, ...) { return 0; }' > "$W/log.c"
 for s in c:libc dl:libdl log:liblog; do

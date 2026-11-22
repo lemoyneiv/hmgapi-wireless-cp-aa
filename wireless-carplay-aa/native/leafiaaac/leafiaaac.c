@@ -26,6 +26,7 @@ typedef unsigned char u8;
 typedef short s16;
 void *dlopen(const char *, int);
 void *dlsym(void *, const char *);
+#define sched_yield() ((void)0)
 #define __android_log_print(p, t, ...) (printf(__VA_ARGS__), printf("\n"))
 #else
 typedef unsigned int u32;
@@ -39,6 +40,7 @@ extern void *calloc(size_t, size_t);
 extern void free(void *);
 extern void *memcpy(void *, const void *, size_t);
 extern void *memset(void *, int, size_t);
+extern int sched_yield(void);
 extern void *dlopen(const char *, int);
 extern void *dlsym(void *, const char *);
 extern int __android_log_print(int prio, const char *tag, const char *fmt, ...);
@@ -150,6 +152,7 @@ static int load_fdk(void)
         return F.ok;
     }
     while (__sync_fetch_and_add(&fdk_state, 0) != 2) {
+        sched_yield();
     }
     return F.ok;
 }
@@ -182,6 +185,7 @@ static int load_opus(void)
         return O.ok;
     }
     while (__sync_fetch_and_add(&opus_state, 0) != 2) {
+        sched_yield();
     }
     return O.ok;
 }

@@ -97,6 +97,9 @@ public final class Wireless extends ModEntry {
         mod.publish(hmgapi.mods.wireless.api.CarPlayIdentification.SERVICE, identity);
     }
 
+    static final String LAUNCHER = "com.android.launcher3";
+    static final String SETTINGS_APP = "com.android.settings";
+
     @Override
     public void appLoaded(final ModContext mod, LoadedApp app) {
         if (NAVIGATION.equals(app.packageName)) navigation(mod, app);
@@ -104,7 +107,8 @@ public final class Wireless extends ModEntry {
         if (GPM.equals(app.packageName) && mod.settingBoolean("usb_drives", true)) usbDrives(mod, app);
         if (GPM.equals(app.packageName) && mod.settingBoolean("tbt", true)) gpmTurnByTurn(mod, app);
         if (BTSETTINGS.equals(app.packageName) && mod.settingBoolean("menu", true)) phoneProjectionMenu(mod, app);
-        if (SYSTEM_POPUP.equals(app.packageName) && mod.settingBoolean("menu", true)) popupSettings(mod, app);
+        if ((SYSTEM_POPUP.equals(app.packageName) || LAUNCHER.equals(app.packageName) || SETTINGS_APP.equals(app.packageName))
+                && mod.settingBoolean("menu", true)) popupSettings(mod, app);
         if (DIPO.equals(app.packageName) && (mod.settingBoolean("tbt", true) || mod.settingBoolean("bridge", true) || mod.settingBoolean("audio", true))) dipo(mod, app);
     }
 
@@ -123,25 +127,16 @@ public final class Wireless extends ModEntry {
 
     /**
      * In the car navigation app, while a phone guides (Android Auto or CarPlay): its own
-     * turn-by-turn calls to the cluster and HUD are skipped, so they don't fight the
-     * phone's. Its speed limit, cameras, traps, warning distances and driver-assist data
-     * still go through (phones carry none of that). Its lanes (updateLaneInfo) don't: with
-     * no route it sends the lanes of every intersection it passes, none marked, in the
-     * same 0xF1 frame as the phone's lanes for the next turn, which it overwrote (US
-     * Ioniq 5, 2026-11-03). Framework calls only: no app names.
+     * turn-by-turn and unmarked intersection lane calls to the cluster and HUD are skipped,
+     * its idle compass frames are captured and replayed immediately when phone guidance ends,
+     * and the phone's countdown bar is spliced into copies of its speed-limit trap frames.
      */
     private void navigation(final ModContext mod, final LoadedApp app) {
         if (!mod.settingBoolean("tbt", true)) return;
         // Keep stock navigation available when this mod cannot supply AA turns. CarPlay
         // and cars with GPM's own turn-by-turn retain their existing arbitration.
         final boolean aaGuidance = Car.stepOfSpec() >= 999 || aaTbtSupported();
-        MethodHook skip = new MethodHook() {
-            @Override
-            protected void beforeHookedMethod(Param p) {
-                if (Car.carPlayGuiding(app.context) || (aaGuidance && Car.androidAutoGuiding(app.context))) p.setResult(null);
-            }
-        };
-        for (String m : NAVI_TBT) mod.hook(null, "framework.navigation_cluster." + m, skip);
+        NaviBridge.install(mod, app, aaGuidance, NAVI_TBT);
         mod.log("navigation: turn-by-turn yields to " + (aaGuidance ? "Android Auto and CarPlay" : "CarPlay")
                 + " in " + app.processName);
     }
@@ -282,9 +277,10 @@ public final class Wireless extends ModEntry {
                                     hmgapi.hook.Cluster c = hmgapi.hook.Cluster.of(app.context);
                                     if (c == null) return;
                                     turns.put(receiver, t = new AaTurns(app.context, c, handler));
-                                    t.standardTurns = mod.settingBoolean("tbt_standard", false);
+                                    t.unitCacheMs = 2000L;
+                                    t.standardTurns = mod.settingBoolean("tbt_standard", true);
                                     mod.log("Android Auto: navigation callback received; cluster bridge created"
-                                            + (t.standardTurns ? " (standard turns)" : ""));
+                                            + (t.standardTurns ? " (standard turns)" : " (projection icons)"));
                                 }
                             }
                             if (t != null) OnTurns.this.run(t, args);

@@ -31,94 +31,56 @@ main display:
 | U-turn | `U_TURN` 31 | 270 (90 for left-hand traffic) |
 | on-ramp (Android Auto's ON_RAMP; the car's navigation has no ramp type, it's a turn point) | `TURN` 13 | 45 / 315 (0 with no side) |
 | fork | `FORK_2` 25 | 90 / 270 |
-| highway exit right / left | `EXIT_RIGHT` 17 / `EXIT_LEFT` 18 (`*_COMBI_1` 19/20 when another maneuver follows) | 90 / 270 |
+| highway exit right / left | `EXIT_RIGHT` 17 / `EXIT_LEFT` 18 (`*_COMBI_1` 19/21 when another maneuver follows) | 90 / 270 |
 | roundabout | `EXIT_ROUNDABOUT_TRS_RIGHT` 32 (33 for left-hand traffic) | the exit's direction |
 | destination ahead / right / left | icon 112 / 113 / 114, no bar | 0 |
 | arrived | `ARRIVED` 3 | 0 |
 
-Angles are in 45 degree steps (the engine works in 7.5 degree units: 0, 6, 12 ... 42).
+Angles are in 45 degree steps (the engine works in 7.5 degree units: 0, 6, 12 ... 42). Under Android Auto, `AaNavState` also decodes the raw `0x8006` `NavigationState` protobuf (`EV_DUMP`) to recover exact maneuvers that GPM's legacy callback collapses (`KEEP_LEFT`/`KEEP_RIGHT` -> `FORK_2` 25, slight vs normal off-ramps, sharp/normal/slight on-ramp angles, merge side, clockwise vs counterclockwise roundabouts, exit-number fallbacks, and EV charging-stop durations).
 
-**The distance bar** is `(100 - progress) / 10`, at least 1, where the progress runs
-from the start of the maneuver's guidance to the maneuver. On the drives that start
-was about 457 m (1,500 ft) out: 0.3 mi 9, 900 ft 6, 800 ft 5, 300 ft 2, 30 ft 1. The
-cluster shows it ×10 (90 ... 10). The navigation also sends the same bar in its trap
-data (`updateTBTTrapInfo`, `barGraphLevel`), with the speed limit and cameras. The
-cluster's bar is drawn from that trap data, which also sets the speed-limit sign, so
-the Wireless mod never sends trap data of its own, and under Android Auto the bar stays
-empty for now. [ar-hud.md](ar-hud.md) has the planned way to fill it with the car
-navigation's speed limit kept.
+**The distance bar and smooth countdown** run over `GUIDE_WINDOW` (457 m / 1,500 ft): `Math.max(1, Math.min(9, m * 10 / 457)) * 10` (90 down to 10). Within `2 * GUIDE_WINDOW`, `AaTurns` and `CpTurns` interpolate remaining distance every 250 ms from observed vehicle velocity (holding steady at red lights when distance stops decreasing, and capping interpolation after 1.75 s if the phone goes quiet). Because Gen5W clusters draw the visual countdown bar from the trap frame (`NavigationCluster.updateTBTTrapInfo` / `updateTBTTrapInfoNew`, `barGraphLevel`) alongside the map speed limit, `NaviBridge` in `com.mnsoft.navi` splices the active phone `bar` into copies of stock navigation's trap frames while preserving the car's map speed limit, unit, and camera warnings.
 
-**Side streets** (the 16-bit `sideStreet`, one bit per 22.5 degrees) are the roads
-the cluster draws around a `TURN` arrow. The car's navigation sent 0 (none) on every
-turn of the drive. `dumpsys` prints 0 as every index "0 1 ... 15" and 65535 as "None",
-its check is inverted. 65535 is what the projection icons always carried, and with a
-`TURN` type it draws a road in every direction, so the mod sends 0 with the car's own
-types and 65535 with the icons.
+**Side streets** (the 16-bit `sideStreet`, one bit per 22.5 degrees) are the roads the cluster draws around a `TURN` arrow. `dumpsys` prints 0 as every index "0 1 ... 15" and 65535 as "None" (its check is inverted): 65535 draws a road in every direction on `TURN` types, while 0 draws none. With enhanced turns (`tbt_standard`, on by default), `CpTurns` builds the 16-bit intersection mask from the iPhone's junction road angles (items 10 & 11), and `AaTurns` derives it from the intersection's lane arrows (`laneSideStreets`), falling back to 0 when geometry is absent and keeping 65535 on projection icons (`>= 64`).
 
-CarPlay's turns follow the same format with the setting on; [ar-hud.md](ar-hud.md#carplay) has its mapping from iAP2 maneuvers.
+CarPlay's turns follow the same format (`tbt_standard`, on by default); [ar-hud.md](ar-hud.md#carplay) has its mapping from iAP2 maneuvers.
 
 ## Roundabouts
 
-Android Auto guides a roundabout in two steps: `ROUNDABOUT_ENTER_AND_EXIT` with the exit's
-angle before it, then `ROUNDABOUT_EXIT` once the car is in it, usually with no side and no
-angle. The Wireless mod keeps the exit icon from the first for the second, until the next
-maneuver.
+Android Auto guides a roundabout in two steps: `ROUNDABOUT_ENTER_AND_EXIT` with the exit's angle before it (or standalone `ROUNDABOUT_ENTER` paired with `ROUNDABOUT_EXIT` in `0x8006`), then `ROUNDABOUT_EXIT` once the car is in it, often with no side and no angle. The Wireless mod keeps the exit icon and CW/CCW direction through `ROUNDABOUT_EXIT` until the next maneuver, falls back to exit numbers when no exit angle is sent, and strips verbose `"At the roundabout, "` prefixes so road names fit narrow cluster cards.
 
-The exit icons are the car navigation's own, one per 45 degrees: 96 (straight on), 97, 99,
-100, 102, 104, 105, 107. It never uses 103 or 106, and on a Creta Electric 106's
-left-hand traffic twin (0xca) draws the loading spinner, so the mod doesn't send them either.
-Roundabouts in the turns ahead get the same icons, with the cluster's direction rather than
-Android Auto's angle.
+The exit icons are the car navigation's own, one per 45 degrees: 96 (straight on), 97, 99, 100, 102, 104, 105, 107. It never uses 103 or 106, and on a Creta Electric 106's left-hand traffic twin (0xca) draws the loading spinner, so the mod doesn't send them either. Roundabouts in the turns ahead get the same icons, with the cluster's direction rather than the raw angle.
 
-**Which way round.** Measured on a US Ioniq 5 (issue #19), parked, by sending each code to the
-cluster service over adb:
+**Which way round.** Measured on a US Ioniq 5 (issue #19), parked, by sending each code to the cluster service over adb:
 
-- In the car's own format, `EXIT_ROUNDABOUT_TRS_RIGHT` (32) draws a counterclockwise roundabout
-  (right-hand traffic) and `EXIT_ROUNDABOUT_TRS_LEFT` (33) a clockwise one. The exit is drawn
-  at the direction sent, in both.
-- The icons 96-107 are counterclockwise, and 192-203 (each + 96) clockwise, with the exit at
-  the same place for the same position in the set (0xc3 is a right exit, like 99).
+- In the car's own format, `EXIT_ROUNDABOUT_TRS_RIGHT` (32) draws a counterclockwise roundabout (right-hand traffic) and `EXIT_ROUNDABOUT_TRS_LEFT` (33) a clockwise one. The exit is drawn at the direction sent, in both.
+- The icons 96-107 are counterclockwise, and 192-203 (each + 96, skipping 199/202) clockwise, with the exit at the same place for the same position in the set (0xc3 is a right exit, like 99).
 - 103 and 106 draw the same as 104 and 107 on this car.
 
-Android Auto's side isn't the way round: it marked a US (counterclockwise) roundabout LEFT, and
-33 drew it clockwise. So the mod picks 32 or 33 from the icon's set (counterclockwise on every
-car it supports), and inside a roundabout it keeps the exit icon whatever side Android Auto
-gives.
+Android Auto's legacy side isn't the way round: it marked a US (counterclockwise) roundabout LEFT, and 33 drew it clockwise. `AaTurns` uses `0x8006`'s explicit `_CW` vs `_CCW` maneuver types (defaulting to counterclockwise when `0x8006` is absent), and `CpTurns` uses the iAP2 driving side (`0` RHT -> 96..107 / 32, `1` LHT -> 192..203 / 33).
+
+## Compass restoration when guidance ends
+
+Sending `DisplayType = 0` (`NONE`) on route end triggers the Gen5W cluster and HUD's 4-bar loading animation until stock navigation crosses a `22.5°` heading boundary. Instead:
+
+1. `AaTurns` and `CpTurns` listen to `com.hkmc.telematics.gis.action.NAVI_GPS_CHANGED`, clear road/destination/turn-list/HUD state, and emit `DisplayType = 8` (`COMPASS`) + heading sub-info quantized in counter-clockwise `22.5°` steps.
+2. `NaviBridge` in `com.mnsoft.navi` captures stock navigation's own idle `DisplayType = 8` compass and sub-info frames and replays them immediately when `PHONE_TBT` reports `active = false` (or when a phone guidance lease expires), restoring the native compass instantaneously even while parked or driving straight.
 
 ## Never 64
 
-The mod never sends 64 (0x40, "no direction"). The cluster draws its loading spinner for
-it, in the turn and in the HUD list, measured on a Creta Electric
-([sirishant/HMG-API, `docs/creta/cluster-turn-by-turn.md`](https://github.com/sirishant/HMG-API/blob/creta-su2iev/docs/creta/cluster-turn-by-turn.md)),
-and on the road it stayed on through a roundabout until the next instruction. Far from a
-turn the cluster draws its card from the turn list, so the turns ahead matter as much as
-the turn itself.
+The mod never sends 64 (0x40, "no direction"). The cluster draws its loading spinner for it, in the turn and in the HUD list, measured on a Creta Electric ([sirishant/HMG-API, `docs/creta/cluster-turn-by-turn.md`](https://github.com/sirishant/HMG-API/blob/creta-su2iev/docs/creta/cluster-turn-by-turn.md)), and on the road it stayed on through a roundabout until the next instruction. Far from a turn the cluster draws its card from the turn list, so the turns ahead matter as much as the turn itself.
 
 - A roundabout with no exit to show, an unknown maneuver and a turn with no side: straight (65).
-- A fork with no side: the plain fork icon (172). Before, it kept the previous maneuver's icon.
-- The turns ahead get the same icons as the turn itself: ramps and forks 172-174, exits
-  81/82/86, ferries 176, destinations 112-114, straight for the rest.
+- A fork with no side: the plain fork icon (172).
+- The turns ahead get the same icons as the turn itself: ramps and forks 172-174, exits 81/82/86, ferries 176, destinations 112-114, straight for the rest.
 
 ## Rerouting
 
-Android Auto reports a reroute as status 3. With the car's own format on (`tbt_standard`),
-a reroute still going after 1 second shows the cluster's "Recalculating..." (type 10,
-`RECALC ROUTE`: drawn with a spinner on a US Ioniq 5, sent parked over adb, and on a Creta
-Electric), until the new route's first turn, or the turn it had when Android Auto goes back
-to guiding on the same route. Distances for the old turn don't replace it. A shorter reroute
-leaves the turn as it is. Without it, the AR HUD broke for about a minute after a missed exit
-on a US EV6 while Android Auto's new route settled.
+Android Auto reports a reroute as status 3. With enhanced turns on (`tbt_standard`), a reroute still going after 1 second shows the cluster's "Recalculating..." (type 10, `RECALC ROUTE`: drawn with a spinner on a US Ioniq 5 and on a Creta Electric), until the new route's first turn (preserving any distance update that arrived during the reroute), or the turn it had when Android Auto goes back to guiding on the same route.
 
 ## Lanes
 
-The car navigation keeps running under a phone's guidance with no route, and sends the
-lanes of each intersection it passes (`updateLaneInfo`, none marked). The Wireless mod
-skips that call while a phone guides; Android Auto's lanes (with its recommended lanes
-marked) go to the cluster alone.
+The car navigation keeps running under a phone's guidance with no route, and sends the lanes of each intersection it passes (`updateLaneInfo`, none marked). `NaviBridge` suppresses those calls while a phone guides; Android Auto's lanes and CarPlay's composite multi-arrow `0xF1` lanes (stem glyphs 9..33 for 2-arrow lanes and 47..54 for 3-arrow lanes, with 2-bit per-part highlight masks) go to the cluster alone.
 
 ## Checking on a car
 
-`adb shell dumpsys com.hkmc.micom.cluster` prints the last values the cluster service
-was sent (type by name, direction, distance, bar, trap data). Once a second during a
-drive, with the car's navigation and then Android Auto on the same route, it shows any
-difference.
+`adb shell dumpsys com.hkmc.micom.cluster` prints the last values the cluster service was sent (type by name, direction, distance, bar, trap data). Once a second during a drive, with the car's navigation and then Android Auto or CarPlay on the same route, it shows any difference.

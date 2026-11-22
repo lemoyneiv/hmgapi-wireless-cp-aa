@@ -10,12 +10,15 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.SystemClock;
 
 import com.broadcom.bt.hfdevice.hfbtcm.HfDeviceBTCMManager;
 import com.tcc.iap2.IIap2Listener;
 import com.tcc.iap2.IIap2Service;
 import com.tcc.iap2.Iap2ListenerInfo;
 import com.tcc.iap2.Iap2NotiMsg;
+
+import java.lang.reflect.Field;
 
 import hmgapi.hook.Car;
 import hmgapi.hook.Cluster;
@@ -27,66 +30,67 @@ import hmgapi.hook.Points;
 /**
  * The Wireless mod in DiPO (the CarPlay app): its app part, linked against DiPO's
  * libraries (com.tcc.iap2, com.broadcom.bt). Wireless.appLoaded starts it.
- *
- * Turn-by-turn ("tbt"): DiPO's own route guidance manager only exists when the car's
- * stepofspec is 999 or more, and stays off (HMG-API never changes stepofspec). HMG-API
- * registers its own listener with the iAP2 server for route guidance (the server sends
- * those notifications to every listener that asks), and CpTurns sends them to the
- * cluster. DiPO still starts and stops the phone's route guidance itself when the
- * phone or the car takes turn-by-turn; a stop clears the HUD (hook on the iAP2 proxy).
- *
- * Native patches (in memory, the files stay stock): libCarPlayCore takes Wi-Fi sessions
- * ("bridge"); libCarPlayAudio offers AAC/Opus on Wi-Fi and libCarPlayUtils sends its
- * audio conversion to the mod's libleafiaaac.so ("audio").
- *
- * Bridge ("bridge"): wireless CarPlay's Bluetooth bridge (Bridge), plus what DiPO needs
- * for it: its own wireless CarPlay off (that's Hyundai's, not this one), its iAP2
- * listener ignoring the bridge's sessions, the reconnect crash fix and the first-connect
- * notice fix.
- *
- * Now Playing ("now_playing", with the bridge): song, artist and album art on wireless
- * CarPlay, which DiPO only asks the phone for on USB (nowPlaying).
  */
 public final class Dipo {
     private Dipo() {}
 
     static final String IAP2_ACTION = "com.remote.service.IAP2SERVICE";
     static final String CP_FIRST_CONNECTED = "com.android.app.PhoneProjection.CP_FIRST_CONNECTED";
-    /** iAP2 listener type for route guidance (notifications 120, 121, 122) */
     static final int LISTENER_ROUTE_GUIDANCE = 4096;
     static final int RG_UPDATE = 120, RG_MANEUVER = 121, RG_LANES = 122;
     static final String[] RG_COMPONENTS = { "RouteGuidanceComponent0" };
+    static final long NP_DELAY = 1500;
+    /** Window after a source switch or active route during which DiPO's own Stop triggers re-subscribe (#24). */
+    static final long STOP_RECOVER_WINDOW_MS = 3500;
 
     static ModContext mod;
     static LoadedApp app;
     static volatile IIap2Service iap2;
     static boolean tbt, bridge, nowPlaying;
-    /** Now Playing asked again this long after the CarPlay channel session comes up */
-    static final long NP_DELAY = 1500;
     static Handler npHandler;
-    /** DiPO's iAP2 manager from the CarPlay channel session's connect (Now Playing asked again through it after a re-attach) */
     static volatile Object npManager;
+    private static volatile Field sDipoIap2Field;
+    private static volatile Class<?> sDipoIap2Owner;
     static Handler turnsHandler;
     static CpTurns turns;
     static RgListener rg;
-    /** asks for route guidance after every comp-5 ready, and the watchdog after each Start (RgWatch) */
     static RgWatch rgWatch;
     private static Handler rgHandler;
-    /** set while HMG-API itself calls the iAP2 server (its own route guidance restart) */
-    static final ThreadLocal<Boolean> OWN = new ThreadLocal<Boolean>();
-    /** onSessionDetails' device id while it runs, and whether its address lookup came back empty */
+    private static volatile long lastSourceSwitchAt = -10000L;
+
     static final ThreadLocal<String> SESSION = new ThreadLocal<String>();
     static final ThreadLocal<Boolean> NO_ADDRESS = new ThreadLocal<Boolean>();
 
+    private static final Runnable serializedRestart = new Runnable() {
+        @Override
+        public void run() {
+            restartRouteGuidance();
+        }
+    };
+
+    private static final Runnable recoverFromDipoStop = new Runnable() {
+        @Override
+        public void run() {
+            IIap2Service s = iap2;
+            if (s == null) return;
+            try {
+                s.Iap2SvcStartRouteGuidanceUpdate(RG_COMPONENTS, true, true);
+                RgWatch w = rgWatch;
+                if (w != null) w.started();
+                log("CarPlay: re-subscribed route guidance after DiPO's stop while CarPlay TBT remained enabled");
+            } catch (Throwable ignored) {
+            }
+        }
+    };
+
     static void log(String m) {
-        mod.log(m);
+        if (mod != null) mod.log(m);
     }
 
     static void error(String m, Throwable t) {
-        mod.error(m, t);
+        if (mod != null) mod.error(m, t);
     }
 
-    /** Wireless.appLoaded, in DiPO's process */
     public static void start(ModContext m, LoadedApp a) {
         mod = m;
         app = a;
@@ -95,15 +99,14 @@ public final class Dipo {
         nowPlaying = bridge && m.settingBoolean("now_playing", true);
         CarPlayLog.on = m.settingBoolean("carplay_log", false);
         CarPlayLog.apply("start");
-        // the CarPlay libraries, patched in memory once DiPO loads them (files stay stock)
-        if (bridge) m.nativePatch(a, "libCarPlayCore.so");   // AirPlay sessions over Wi-Fi
+        if (bridge) m.nativePatch(a, "libCarPlayCore.so");
         if (m.settingBoolean("audio", true)) {
-            m.nativePatch(a, "libCarPlayAudio.so");   // offer AAC and Opus on Wi-Fi
-            m.nativePatch(a, "libCarPlayUtils.so");   // its AudioConverter calls go to libleafiaaac.so
+            m.nativePatch(a, "libCarPlayAudio.so");
+            m.nativePatch(a, "libCarPlayUtils.so");
         }
-        if (tbt) turnByTurn();
         if (!tbt && !bridge) return;
         rgWatch();
+        if (tbt) turnByTurn();
         if (bridge) bridge();
         Intent i = new Intent(IAP2_ACTION);
         boolean bound = a.context.bindService(i, new ServiceConnection() {
@@ -118,6 +121,7 @@ public final class Dipo {
             @Override
             public void onServiceDisconnected(ComponentName name) {
                 iap2 = null;
+                if (bridge) Bridge.onIap2ServiceLost();
                 log("DiPO: iAP2 server gone");
             }
         }, Context.BIND_AUTO_CREATE);
@@ -141,18 +145,33 @@ public final class Dipo {
         turns = new CpTurns(app.context, c, new Runnable() {
             @Override
             public void run() {
+                lastSourceSwitchAt = SystemClock.elapsedRealtime();
                 RgWatch w = rgWatch;
-                if (w != null) w.started();   // a Start of ours: watched
-                restartRouteGuidance();
+                if (w != null) w.started();
+                queueRestartRouteGuidance();
             }
-        });
-        turns.standardTurns = mod.settingBoolean("tbt_standard", false);
-        if (turns.standardTurns) log("CarPlay: turns in the car's own format near a maneuver (standard turns)");
+        }, turnsHandler);
+        turns.unitCacheMs = 2000L;
+        turns.standardTurns = mod.settingBoolean("tbt_standard", true);
+        log("CarPlay: turn-by-turn to the cluster (" + (turns.standardTurns ? "enhanced native scenes" : "projection icons") + ")");
         rg = new RgListener();
         mod.hook(app.classLoader, "dipo.iap2_proxy.stop_route_guidance", new MethodHook() {
             @Override
             protected void beforeHookedMethod(Param p) {
-                if (OWN.get() != null) return;
+                long elapsed = SystemClock.elapsedRealtime();
+                boolean sourceSwitching = elapsed - lastSourceSwitchAt < STOP_RECOVER_WINDOW_MS;
+                boolean stillGuiding = Car.carPlayGuiding(app.context);
+                log("CarPlay: DiPO stopped route guidance (carPlayGuiding=" + stillGuiding + ", sourceSwitch=" + sourceSwitching + ")");
+                if (sourceSwitching || stillGuiding) {
+                    // Issue #24: when switching from Apple Maps to Google Maps/Waze, DiPO emits
+                    // StopRouteGuidanceUpdate for the old route ~70 ms after TurnByTurn: ENABLE.
+                    // Re-subscribe cleanly instead of disarming RgWatch!
+                    if (rgHandler != null) {
+                        rgHandler.removeCallbacks(recoverFromDipoStop);
+                        rgHandler.postDelayed(recoverFromDipoStop, 300);
+                    }
+                    return;
+                }
                 RgWatch w = rgWatch;
                 if (w != null) w.stopped();
                 post(new Runnable() {
@@ -163,7 +182,6 @@ public final class Dipo {
                 });
             }
         });
-        log("CarPlay: turn-by-turn to the cluster (HMG-API's route guidance listener)");
     }
 
     static void post(Runnable r) {
@@ -180,6 +198,15 @@ public final class Dipo {
         });
     }
 
+    private static void queueRestartRouteGuidance() {
+        if (rgHandler != null) {
+            rgHandler.removeCallbacks(serializedRestart);
+            rgHandler.post(serializedRestart);
+        } else if (turnsHandler != null) {
+            post(serializedRestart);
+        }
+    }
+
     static void registerRouteGuidance(IIap2Service s) {
         try {
             Iap2ListenerInfo info = new Iap2ListenerInfo();
@@ -191,30 +218,23 @@ public final class Dipo {
         }
     }
 
-    /** after a source change: Stop, then Start, so the phone sends its whole current state (the build's HmgApiRgRestart) */
     static void restartRouteGuidance() {
         IIap2Service s = iap2;
         if (s == null) return;
-        OWN.set(Boolean.TRUE);
         try {
             s.Iap2SvcStopRouteGuidanceUpdate(RG_COMPONENTS);
             Thread.sleep(200);
             s.Iap2SvcStartRouteGuidanceUpdate(RG_COMPONENTS, true, true);
-        } catch (Throwable t) {
-            // the session went away meanwhile
-        } finally {
-            OWN.remove();
+        } catch (Throwable ignored) {
         }
     }
 
-    /** HMG-API's iAP2 listener for route guidance: everything goes to CpTurns on its thread */
     static final class RgListener extends IIap2Listener.Stub {
         @Override
         public void connected(int component, String serial) {}
 
         @Override
         public void disconnected(final int component) {
-            // as DiPO's listener: component 2 isn't a session, and the bridge's own sessions end while wireless CarPlay runs
             if (component == 2 || (bridge && Bridge.dipoIgnoreDisconnect(component))) return;
             post(new Runnable() {
                 @Override
@@ -244,14 +264,12 @@ public final class Dipo {
         final ClassLoader cl = app.classLoader;
         Bridge.cl = cl;
         Bridge.context = app.context;
-        // Broadcom's manager: DiPO registers its listener once the service is connected; the bridge's follows
         mod.hook(cl, "dipo.btcm.register_listener", new MethodHook() {
             @Override
             protected void afterHookedMethod(Param p) {
                 if (!Bridge.isOurs(p.args[0])) Bridge.onBtcmReady((HfDeviceBTCMManager) p.thisObject);
             }
         });
-        // DiPO's CarPlay callbacks (observed)
         mod.hook(cl, "dipo.carplay.session_created", new MethodHook() {
             @Override
             protected void beforeHookedMethod(Param p) {
@@ -277,11 +295,6 @@ public final class Dipo {
                 Bridge.onCpIapIn(p.thisObject, (byte[]) p.args[0], (Integer) p.args[1]);
             }
         });
-        // the CarPlay library's disableBluetooth: DiPO disconnects the phone's whole Bluetooth link, as for
-        // wired CarPlay. On a wireless session some phones then end it after about a minute (#5), so the
-        // link stays up while wireless CarPlay runs (persist.ev6.cpwl.keepbt=0: DiPO's way). A car whose
-        // map has no such point yet (made from a Car Report older than HMG-API 1.1.0) goes without: the
-        // hooks after this one must still go in.
         if (Points.has("dipo.carplay.disable_bluetooth")) {
             mod.hook(cl, "dipo.carplay.disable_bluetooth", new MethodHook() {
                 @Override
@@ -294,16 +307,12 @@ public final class Dipo {
         } else {
             log("DiPO: this car's map has no dipo.carplay.disable_bluetooth: Bluetooth isn't kept up for wireless CarPlay");
         }
-        // DiPO's own wireless CarPlay (Hyundai's) stays off: the feature file is there for the other apps
         mod.hook(cl, "dipo.utils.is_support_wireless_carplay", new MethodHook() {
             @Override
             protected void beforeHookedMethod(Param p) {
                 p.setResult(false);
             }
         });
-        // DiPO's iAP2 listener: a Bluetooth CarPlay session (4) is a phone like USB (1); the
-        // CarPlay-channel session (5) only turns its notifications on; the bridge's sessions
-        // ending, and the channel session's identification, aren't DiPO's business
         mod.hook(cl, "dipo.iap2_listener.connected", new MethodHook() {
             @Override
             protected void beforeHookedMethod(Param p) {
@@ -338,9 +347,6 @@ public final class Dipo {
         reconnectFix(cl);
         firstConnectNotice();
         {
-            // the iAP2 server's word that a session's link failed (the CarPlay channel's is attached again), or that a
-            // session is identified and authenticated (a re-attach counts only then, and route guidance is asked for
-            // again after every one: Bridge, Reattach, RgWatch). Always on now: RgWatch needs it with re-attach off too.
             IntentFilter f = new IntentFilter(Bridge.ACTION_IAP2_CONNECTFAIL);
             f.addAction(Bridge.ACTION_IAP2_CONNECTSUCCESS);
             app.context.registerReceiver(new BroadcastReceiver() {
@@ -360,17 +366,6 @@ public final class Dipo {
         log("bridge: wireless CarPlay Bluetooth bridge in DiPO");
     }
 
-    /**
-     * Now Playing on wireless CarPlay. DiPO asks the phone for Now Playing (Iap2SvcNowPlayingStart)
-     * only when a USB CarPlay session starts. On wireless, iAP2 then moves from the Bluetooth
-     * session to the CarPlay channel, whose identification the bridge keeps from DiPO, so a
-     * subscription made before the move gets one update, then nothing. Once the channel
-     * session is up: stop and start Now Playing again, NP_DELAY later and on its own thread (a
-     * binder call into the iAP2 server from its own callback could deadlock); stopped when the
-     * channel session ends. Through DiPO's own iAP2 connection, so its listener gets the
-     * updates as on USB: the manager's one IIap2Service field (EV6 and Ioniq 6 260507), or
-     * HMG-API's own binding when there isn't one.
-     */
     private static void nowPlaying(final Object manager, final boolean start) {
         npHandler.removeCallbacksAndMessages(null);
         npHandler.postDelayed(new Runnable() {
@@ -392,19 +387,8 @@ public final class Dipo {
         }, start ? NP_DELAY : 0);
     }
 
-    /**
-     * After a re-attach of the CarPlay channel's iAP2 session (Bridge, Reattach): the phone is
-     * asked for route guidance (Stop, then Start, as a source change does) and Now Playing again.
-     */
     static void askAgain() {
-        if (tbt && turnsHandler != null) {
-            post(new Runnable() {
-                @Override
-                public void run() {
-                    restartRouteGuidance();
-                }
-            });
-        }
+        if (tbt) queueRestartRouteGuidance();
         if (nowPlaying && npHandler != null) nowPlaying(npManager, true);
     }
 
@@ -415,7 +399,7 @@ public final class Dipo {
         rgWatch = new RgWatch(new RgWatch.Host() {
             @Override
             public long now() {
-                return android.os.SystemClock.elapsedRealtime();
+                return SystemClock.elapsedRealtime();
             }
 
             @Override
@@ -436,14 +420,7 @@ public final class Dipo {
 
             @Override
             public void restart() {
-                if (tbt && turnsHandler != null) {
-                    post(new Runnable() {
-                        @Override
-                        public void run() {
-                            restartRouteGuidance();
-                        }
-                    });
-                }
+                if (tbt) queueRestartRouteGuidance();
             }
 
             @Override
@@ -453,7 +430,6 @@ public final class Dipo {
         }, tbt);
     }
 
-    /** Bridge: the CarPlay channel's session (RgWatch) */
     static void rgSessionUp() {
         RgWatch w = rgWatch;
         if (w != null) w.sessionUp();
@@ -469,42 +445,46 @@ public final class Dipo {
         if (w != null) w.linkDown(why);
     }
 
-    /** Reattach's ask after a re-attach is ready: through RgWatch (logged, watched) */
     static void rgAsk(String how) {
         RgWatch w = rgWatch;
         if (w != null) w.ask(how);
         else askAgain();
     }
 
-    /** DiPO's iAP2 connection: the one IIap2Service field of its iAP2 manager (else HMG-API's) */
+    /** DiPO's iAP2 connection (cached Field lookup on DiPO's manager class, fallback to HMG-API's). */
     private static IIap2Service dipoIap2(Object manager) {
         if (manager != null) {
-            for (Class<?> c = manager.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
-                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
-                    if (f.getType() != IIap2Service.class) continue;
-                    try {
-                        f.setAccessible(true);
-                        Object s;
-                        synchronized (manager) {
-                            s = f.get(manager);
+            Class<?> owner = manager.getClass();
+            Field cached = sDipoIap2Field;
+            if (cached == null || sDipoIap2Owner != owner) {
+                cached = null;
+                for (Class<?> c = owner; c != null && c != Object.class && cached == null; c = c.getSuperclass()) {
+                    for (Field f : c.getDeclaredFields()) {
+                        if (f.getType() == IIap2Service.class) {
+                            f.setAccessible(true);
+                            cached = f;
+                            break;
                         }
-                        if (s != null) return (IIap2Service) s;
-                    } catch (Throwable t) {
-                        error("Now Playing: DiPO's iAP2 connection", t);
                     }
+                }
+                sDipoIap2Field = cached;
+                sDipoIap2Owner = owner;
+            }
+            if (cached != null) {
+                try {
+                    Object s;
+                    synchronized (manager) {
+                        s = cached.get(manager);
+                    }
+                    if (s != null) return (IIap2Service) s;
+                } catch (Throwable t) {
+                    error("Now Playing: DiPO's iAP2 connection", t);
                 }
             }
         }
         return iap2;
     }
 
-    /**
-     * DiPO crash on a wireless reconnect (stock bug): an iAP2 drop clears the phone's iAP2
-     * Bluetooth address, and a wireless session can restart before iAP2 is back;
-     * onSessionDetails upper-cases that address unchecked. As the bridge build: when it's
-     * missing there, the session's own device id stands in, or (no id either) the stored
-     * CarPlay address is kept. Only inside onSessionDetails; every other caller checks.
-     */
     private static void reconnectFix(final ClassLoader cl) {
         mod.hook(cl, "dipo.session_listener.session_details", new MethodHook() {
             @Override
@@ -536,12 +516,6 @@ public final class Dipo {
         });
     }
 
-    /**
-     * CarPlay's first-connect notice: DiPO looks it up by the phone's Bluetooth address
-     * (before iAP2 identification), but saves it under the iPhone's serial, so on a
-     * wireless connect it came up every time. As the bridge build: also saved under the
-     * Bluetooth address of the last iAP2 session.
-     */
     private static void firstConnectNotice() {
         app.context.registerReceiver(new BroadcastReceiver() {
             @Override

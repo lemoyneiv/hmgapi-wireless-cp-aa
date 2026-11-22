@@ -189,6 +189,12 @@ public final class AaSupportTest {
             ModContext menu = enabled();
             wireless.appLoaded(menu, new LoadedApp(Wireless.BTSETTINGS));
             check(menu.hooks.containsKey("btsettings.projection_helper.open_wireless_page"), "projection menu unaffected");
+            ModContext launcher = enabled();
+            wireless.appLoaded(launcher, new LoadedApp(Wireless.LAUNCHER));
+            check(launcher.hooks.containsKey("framework.activity.start_activity_for_result"), "launcher wireless popup redirect installed");
+            ModContext sysSettings = enabled();
+            wireless.appLoaded(sysSettings, new LoadedApp(Wireless.SETTINGS_APP));
+            check(sysSettings.hooks.containsKey("framework.activity.start_activity_for_result"), "android settings wireless popup redirect installed");
 
             ModContext off = enabled();
             off.settings.put("tbt", false);
@@ -200,6 +206,7 @@ public final class AaSupportTest {
             wireless.appLoaded(stock, new LoadedApp(Wireless.GPM));
             check(stock.natives.isEmpty() && stock.hooks.size() == 1, "native GPM TBT is preserved at step 999");
             Car.step = 105;
+            testNaviBridge(unknown);
             if (args.length > 0) {
                 File ceev = new File(args[0]);
                 check(ceev.isFile(), "private CEEV library exists");
@@ -210,6 +217,139 @@ public final class AaSupportTest {
             Files.deleteIfExists(unknown.toPath());
             Files.deleteIfExists(directory.toPath());
         }
-        System.out.println("ok    AA native support: " + checks + " checks (no car access)");
+        System.out.println("ok    AA native support & NaviBridge: " + checks + " checks (no car access)");
+    }
+
+    public static final class FakeTrapInfo {
+        public int barGraphLevel;
+        public int speedLimit;
+        public int speedUnit;
+
+        public FakeTrapInfo() {}
+
+        FakeTrapInfo(int bar, int limit, int unit) {
+            this.barGraphLevel = bar;
+            this.speedLimit = limit;
+            this.speedUnit = unit;
+        }
+    }
+
+    public static final class FakeClusterTarget {
+        final java.util.List<String> replayed = new java.util.ArrayList<String>();
+
+        public void updateTbtInfo(int type, int sides, float dir) {
+            replayed.add("tbt " + type + " " + sides + " " + dir);
+        }
+
+        public void updateSubInfo(float dist, int flag, int unit, int h, int m, int tt, int tf, float heading, int a, int b) {
+            replayed.add("sub " + flag + " " + heading);
+        }
+
+        public void updateTrapInt(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7,
+                                  int a8, int a9, int a10, int bar, int speedLimit, int a13, int a14, int a15, int a16) {
+            replayed.add("trapInt bar=" + bar + " speed=" + speedLimit);
+        }
+
+        public void updateTrapObj(Object info) {
+            FakeTrapInfo f = (FakeTrapInfo) info;
+            replayed.add("trapObj bar=" + f.barGraphLevel + " speed=" + f.speedLimit + " unit=" + f.speedUnit);
+        }
+    }
+
+    private static void testNaviBridge(File unknownLib) throws Throwable {
+        Points.availablePoints.clear();
+        Points.classes.clear();
+        Points.availablePoints.add(NaviBridge.PT_TRAP_INT);
+        Points.availablePoints.add(NaviBridge.PT_TRAP_NEW);
+        Points.availablePoints.add(NaviBridge.PT_TRAP_CLS);
+        Points.availablePoints.add(NaviBridge.PT_TRAP_CTOR);
+        Points.availablePoints.add(NaviBridge.PT_TRAP_BAR);
+        Points.classes.put(NaviBridge.PT_TRAP_CLS, FakeTrapInfo.class);
+
+        Car.aaGuiding = false;
+        Car.cpGuiding = false;
+        NaviBridge.testNow = 1000L;
+
+        ModContext mod = enabled();
+        NaviBridge bridge = NaviBridge.install(mod, new LoadedApp(Wireless.NAVIGATION), true, Wireless.NAVI_TBT);
+        check(mod.hooks.containsKey(NaviBridge.PT_TRAP_INT) && mod.hooks.containsKey(NaviBridge.PT_TRAP_NEW),
+                "NaviBridge installs both 17-int and NaviTbtTrapInfo hooks when points exist");
+
+        FakeClusterTarget target = new FakeClusterTarget();
+        java.lang.reflect.Method mTbt = FakeClusterTarget.class.getMethod("updateTbtInfo", int.class, int.class, float.class);
+        java.lang.reflect.Method mSub = FakeClusterTarget.class.getMethod("updateSubInfo",
+                float.class, int.class, int.class, int.class, int.class, int.class, int.class, float.class, int.class, int.class);
+        java.lang.reflect.Method mTrapInt = FakeClusterTarget.class.getMethod("updateTrapInt",
+                int.class, int.class, int.class, int.class, int.class, int.class, int.class, int.class,
+                int.class, int.class, int.class, int.class, int.class, int.class, int.class, int.class, int.class);
+        java.lang.reflect.Method mTrapObj = FakeClusterTarget.class.getMethod("updateTrapObj", Object.class);
+
+        MethodHook hTbt = mod.hooks.get("framework.navigation_cluster.update_tbt_info");
+        MethodHook hSub = mod.hooks.get("framework.navigation_cluster.update_tbt_sub_info");
+        MethodHook hTrapInt = mod.hooks.get(NaviBridge.PT_TRAP_INT);
+        MethodHook hTrapObj = mod.hooks.get(NaviBridge.PT_TRAP_NEW);
+
+        // 1. Idle stock navigation emits DisplayType 8 compass + 65 mph trap frames: passed through & captured
+        MethodHook.Param p1 = hTbt.beforeMethod(mTbt, target, 8, 0, 225f);
+        MethodHook.Param p2 = hSub.beforeMethod(mSub, target, 0f, -3, 15, -1, -1, -1, -1, 225f, 0, -1);
+        check(!hTbt.skipsOriginal(), "idle stock compass passes through");
+
+        Object[] trap17 = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 0, 0, 0, 0 };
+        hTrapInt.beforeMethod(mTrapInt, target, trap17);
+        check(trap17[11].equals(0) && trap17[12].equals(65), "idle 17-int trap frame untouched");
+
+        FakeTrapInfo stockObj = new FakeTrapInfo(0, 65, 2);
+        Object[] trapObjArgs = { stockObj };
+        hTrapObj.beforeMethod(mTrapObj, target, trapObjArgs);
+        check(((FakeTrapInfo) trapObjArgs[0]).barGraphLevel == 0 && ((FakeTrapInfo) trapObjArgs[0]).speedLimit == 65,
+                "idle NaviTbtTrapInfo untouched");
+
+        // 2. Phone TBT starts with bar=80: stock TBT suppressed, trap frames re-sent with bar=80 & speed=65 intact
+        NaviBridge.testNow = 2000L;
+        bridge.onPhoneTbt("aa", true, 80, 2000L);
+        Handler.drain();
+        check(bridge.shouldSuppress(2000L), "stock TBT suppressed during active AA lease");
+        check(target.replayed.equals(Arrays.asList("trapInt bar=80 speed=65", "trapObj bar=80 speed=65 unit=2")),
+                "NaviBridge splices bar=80 into re-sent trap frames while preserving 65 mph speed limit");
+        check(stockObj.barGraphLevel == 0, "original stock NaviTbtTrapInfo instance is never mutated");
+        target.replayed.clear();
+
+        // 3. Stock navigation updates speed limit to 55 mph during phone guidance: outgoing gets bar=80, baseline saves bar=0/speed=55
+        NaviBridge.testNow = 2500L;
+        Object[] trap55 = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 55, 0, 0, 0, 0 };
+        hTrapInt.beforeMethod(mTrapInt, target, trap55);
+        check(trap55[11].equals(80) && trap55[12].equals(55), "live stock 55 mph update carries spliced bar=80");
+        FakeTrapInfo stock55 = new FakeTrapInfo(0, 55, 2);
+        Object[] obj55Args = { stock55 };
+        hTrapObj.beforeMethod(mTrapObj, target, obj55Args);
+        check(((FakeTrapInfo) obj55Args[0]).barGraphLevel == 80 && ((FakeTrapInfo) obj55Args[0]).speedLimit == 55
+                && stock55.barGraphLevel == 0,
+                "live stock NaviTbtTrapInfo 55 mph update cloned with bar=80 without mutating stock instance");
+
+        // 4. Phone TBT ends while Car.aaGuiding is STILL lagging true: END_GRACE_MS allows immediate compass replay & bar=0 restore!
+        Car.aaGuiding = true;
+        NaviBridge.testNow = 3000L;
+        bridge.onPhoneTbt("aa", false, -1, 3000L);
+        Handler.drain();
+        check(!bridge.shouldSuppress(3200L), "END_GRACE_MS prevents lagging Car.aaGuiding from blocking compass recovery");
+        check(target.replayed.contains("tbt 8 0 225.0") && target.replayed.contains("sub -3 225.0"),
+                "stock DisplayType 8 compass and heading sub-info replayed immediately on route end");
+        check(target.replayed.contains("trapInt bar=0 speed=55") && target.replayed.contains("trapObj bar=0 speed=55 unit=2"),
+                "trap bar restored to 0 with latest 55 mph speed limit preserved");
+
+        // 5. Lease expiry fail-safe if phone disconnects abruptly without active=false broadcast
+        Car.aaGuiding = false;
+        target.replayed.clear();
+        NaviBridge.testNow = 10000L;
+        bridge.onPhoneTbt("cp", true, 50, 10000L);
+        target.replayed.clear();
+        NaviBridge.testNow = 17000L; // > 6000 ms LEASE_MS
+        bridge.onTick(17000L);
+        check(target.replayed.contains("tbt 8 0 225.0") && target.replayed.contains("trapInt bar=0 speed=55"),
+                "lease expiry fail-safe restores stock compass and clears trap bar");
+
+        NaviBridge.testNow = -1;
+        Points.availablePoints.clear();
+        Points.classes.clear();
     }
 }

@@ -9,20 +9,28 @@ public abstract class MethodHook {
         return p.returnEarly;
     }
     public final Param before(Object target, Object... args) throws Throwable {
-        Param p = param(target, args);
+        return beforeMethod(null, target, args);
+    }
+    public final Param beforeMethod(java.lang.reflect.Member m, Object target, Object... args) throws Throwable {
+        Param p = param(m, target, args);
         beforeHookedMethod(p);
         return p;
     }
     public final void after(Object target, Object... args) throws Throwable {
-        afterHookedMethod(param(target, args));
+        afterMethod(null, target, args);
     }
-    private static Param param(Object target, Object[] args) {
+    public final void afterMethod(java.lang.reflect.Member m, Object target, Object... args) throws Throwable {
+        afterHookedMethod(param(m, target, args));
+    }
+    private static Param param(java.lang.reflect.Member m, Object target, Object[] args) {
         Param p = new Param();
+        p.method = m;
         p.thisObject = target;
         p.args = args;
         return p;
     }
     public static final class Param {
+        public java.lang.reflect.Member method;
         public Object thisObject;
         public Object[] args = new Object[0];
         private boolean returnEarly;

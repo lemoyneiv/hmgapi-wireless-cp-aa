@@ -1,16 +1,25 @@
 package hmgapi.mods.wireless;
 
+import android.content.Context;
+import android.content.Intent;
 import android.os.Handler;
 
+import java.io.ByteArrayOutputStream;
 import java.util.List;
 
 import hmgapi.hook.Car;
 import hmgapi.hook.Cluster;
 
 /**
- * Host test of AaTurns: a drive through the AA library's callbacks, checking every
- * cluster call against what the turn-by-turn build's GpmNaviTBTManager sends for the
- * same input (worked out from its code).
+ * Host test of AaTurns: verifies both fallback projection-icon mode (standardTurns = false)
+ * and default enhanced cluster/AR-HUD mode (standardTurns = true), including:
+ *   - Compass restoration (DisplayType 8 + live car GPS heading) & NaviBridge PHONE_TBT IPC
+ *   - Clean maneuver-transition distance resets while preserving pre-sent reroute distances
+ *   - 0x8006 AaNavState exact maneuver recovery (keep left/right, slight/normal off-ramps,
+ *     on-ramp angles, merge side, CW/CCW roundabouts, two-step ROUNDABOUT_ENTER, exit-number
+ *     fallbacks, charging-stop duration text, 2nd-step HUD arrow)
+ *   - Lane-derived intersection side streets (laneSideStreets)
+ *   - Observed-velocity 250 ms approaching-turn countdown (stationary hold, staleness cap)
  */
 public final class AaTurnsTest {
     static int fail;
@@ -36,24 +45,87 @@ public final class AaTurnsTest {
         return r;
     }
 
+    // Minimal protobuf writer for synthetic 0x8006 NavigationState dumps
+    static final class W {
+        final ByteArrayOutputStream o = new ByteArrayOutputStream();
+
+        W v(int f, long x) {
+            raw(f << 3);
+            raw(x);
+            return this;
+        }
+
+        W s(int f, String x) {
+            try {
+                byte[] b = x.getBytes("UTF-8");
+                raw((f << 3) | 2);
+                raw(b.length);
+                o.write(b, 0, b.length);
+                return this;
+            } catch (java.io.UnsupportedEncodingException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        W m(int f, W x) {
+            byte[] b = x.o.toByteArray();
+            raw((f << 3) | 2);
+            raw(b.length);
+            o.write(b, 0, b.length);
+            return this;
+        }
+
+        void raw(long x) {
+            while ((x & ~0x7FL) != 0) {
+                o.write((int) ((x & 0x7F) | 0x80));
+                x >>>= 7;
+            }
+            o.write((int) x);
+        }
+
+        String dumpS() {
+            byte[] b = o.toByteArray();
+            StringBuilder sb = new StringBuilder("S ").append(b.length).append(' ');
+            for (byte v : b) sb.append(String.format("%02x", v & 0xff));
+            return sb.toString();
+        }
+    }
+
+    static W step(int exactType, int exitNum, int exitAngle, String text) {
+        W m = new W().v(1, exactType);
+        if (exitNum >= 0) m.v(2, exitNum);
+        if (exitAngle >= 0) m.v(3, exitAngle);
+        W st = new W().m(1, m);
+        if (text != null) st.m(2, new W().s(1, text));
+        return st;
+    }
+
     public static void main(String[] a) {
         java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("UTC"));
+        AaTurns.testNow = -1;
         Car.unit = Car.DISTANCE_MILES;
         c = new Cluster();
+
+        check("standardTurns is enabled by default", new AaTurns(new Context(), c, new Handler()).standardTurns);
+
+        // ---- 1. Fallback projection-icon mode (standardTurns = false)
         Handler h = new Handler();
-        AaTurns t = new AaTurns(new android.content.Context(), c, h);
-        final int RIGHT = 2, LEFT = 1, TURN = 4, MILES = 4, MILES_P1 = 5, METERS = 1, FEET = 6;
+        Context ctx = new Context();
+        AaTurns t = new AaTurns(ctx, c, h);
+        t.standardTurns = false;
+        final int RIGHT = 2, LEFT = 1, UNSPECIFIED = 3, TURN = 4, MILES = 4, MILES_P1 = 5, METERS = 1, FEET = 6;
 
         t.nextTurn("Main St", RIGHT, TURN, -1, 0);
-        expect("no route yet: road name only", "road [Main St]");
+        expect("before status(1): cluster untouched while route inactive");
         t.status(1);
-        t.nextTurn("Main St", RIGHT, TURN, -1, 0);
-        expect("right turn: turn, HUD list, HUD distance", "road [Main St]", "tbt 67 65535 90.0 0.0 0 0 0 32 0",
-                "hud f201430000" + utf16("Main St"), "2c 0 0 0 0 0 0 0 0 0");
+        expect("status(1) flushes buffered turn immediately (no 1.3s blank wait)",
+                "road [Main St]", "tbt 67 65535 90.0 -1.0 0 0 0 254 -2",
+                "hud f201430000" + utf16("Main St"));
         t.nextTurnDistance(320, 30, 200, MILES_P1);
-        expect("0.2 mi: HUD list unchanged, not resent", "tbt 67 65535 90.0 0.2 0 0 2 32 0", "2c 2 2 0 0 0 0 0 0 0");
+        expect("0.2 mi (basic mode): icon 67, HUD list unchanged, not resent",
+                "tbt 67 65535 90.0 0.2 0 0 2 32 0", "2c 2 2 0 0 0 0 0 0 0");
         t.nextTurnDistance(100, 10, 100, METERS);
-        expect("100 m with miles set: feet", "tbt 67 65535 90.0 328.1 0 0 3 32 0", "2c 3 0 328 0 0 0 0 0 0");
+        expect("100 m with miles set: 328.1 feet", "tbt 67 65535 90.0 328.1 0 0 3 32 0", "2c 3 0 328 0 0 0 0 0 0");
         Car.unit = Car.DISTANCE_KM;
         t.nextTurnDistance(1500, 60, 932, MILES);
         expect("0.9 mi with km set: 1.5 km", "tbt 67 65535 90.0 1.5 0 0 1 32 0", "2c 1 5 1 0 0 0 0 0 0");
@@ -61,7 +133,8 @@ public final class AaTurnsTest {
 
         String lanes = "02" + "01aabbcc" + "02000000";
         t.nextTurn(lanes, 0, 34, 0, 0);
-        expect("lanes (count, a free byte, lane types; arrows from byte 19)", "lanes f102000102" + "0000000000000000000000000000" + "aabbcc");
+        expect("lanes (count, a free byte, lane types; arrows from byte 19)",
+                "lanes f102000102" + "0000000000000000000000000000" + "aabbcc");
         t.nextTurn(lanes, 0, 34, 0, 0);
         expect("same lanes: not resent");
         t.nextTurn("02zz", 0, 34, 0, 0);
@@ -87,10 +160,21 @@ public final class AaTurnsTest {
         expect("owner switched to km: resent", "sub 16.0 0 1 8 0 1 1 0.0 -1 1");
         Car.unit = Car.DISTANCE_MILES;
 
+        // Deliver a live car heading (90 deg East -> cluster compass 270.0) before route end
+        ctx.deliver(new Intent(AaTurns.NAVI_GPS_ACTION).putExtra(AaTurns.NAVI_HEADING_EXTRA, 90));
         t.status(2);
-        expect("guidance ends: everything cleared", "dest 0 []", "tbt 0 0 0.0 0.0 -1 0 0 0 -1",
-                "sub 0.0 -1 0 0 0 0 0 0.0 -1 0", "2c 0 0 0 0 0 0 0 0 0", "lanes f1", "hud f2", "hud f2");
+        expect("guidance ends: restores DisplayType 8 (COMPASS) with live heading, clears text/turnList/HUD",
+                "dest 0 []", "road []", "list",
+                "tbt 8 0 270.0 0.0 0 0 0 0 -1",
+                "sub 0.0 -3 15 -1 -1 -1 -1 270.0 0 -1",
+                "2c 0 0 0 0 0 0 0 0 0", "lanes f1", "hud f2", "hud f2");
         check("unit check stopped", h.delayed == null);
+        Intent lastBc = ctx.broadcasts.get(ctx.broadcasts.size() - 1);
+        check("PHONE_TBT inactive broadcast sent to com.mnsoft.navi",
+                AaTurns.ACTION_PHONE_TBT.equals(lastBc.getAction())
+                        && AaTurns.NAVI_PKG.equals(lastBc.getPackage())
+                        && !lastBc.getBooleanExtra("active", true)
+                        && lastBc.getIntExtra("bar", 0) == -1);
 
         t.status(1);
         t.nextTurn("Home", 0, 32, 0, 2);
@@ -99,7 +183,9 @@ public final class AaTurnsTest {
         expect("same destination: not resent");
         check("destination point kept", t.estPoint == 3);
 
-        AaTurns d = new AaTurns(new android.content.Context(), c, new Handler());
+        // ---- 2. Roundabout & fallback icon guarantees (never 64)
+        AaTurns d = new AaTurns(new Context(), c, new Handler());
+        d.standardTurns = false;
         d.status(1);
         d.nextTurn("Start Rd", 0, 1, 0, 0);
         expect("depart (first): road as destination, no distance yet", "dest 0 [Start Rd]", "tbt 2 65535 0.0 -1.0 0 0 0 254 -2");
@@ -110,16 +196,15 @@ public final class AaTurnsTest {
         int logged = android.util.Log.count;
         d.nextTurn("Circle", RIGHT, 13, 100, 0);
         d.nextTurn("Circle", RIGHT, 13, 100, 0);
-        check("maneuver log: the same maneuver again (Android Auto resends it) isn't logged again", android.util.Log.count == logged);
+        check("maneuver log: the same maneuver again isn't logged again", android.util.Log.count == logged);
         c.calls.clear();
         d.nextTurn("Old Rd", 0, 11, 0, 0);
-        expect("roundabout enter: not for the cluster");
-        final int UNSPECIFIED = 3;
+        expect("roundabout enter (basic mode): not for the cluster, preserves roundaboutType");
         d.nextTurn("Old Rd", UNSPECIFIED, 12, -1, 0);
-        expect("in the roundabout (exit, no side, no angle): its exit stays on, not 64 (the cluster's spinner)",
+        expect("in the roundabout (exit, no side, no angle): its exit stays on, not 64",
                 "road [Old Rd]", "tbt 99 65535 90.0 -1.0 0 0 0 254 -2", "hud f201630000" + utf16("Old Rd"));
         d.nextTurn("Old Rd", LEFT, 12, -1, 0);
-        expect("in the roundabout with a side (LEFT, as for a US one): its exit stays on, not 33 (clockwise)",
+        expect("in the roundabout with a side (LEFT, as for a US one): its exit stays on, not 33",
                 "road [Old Rd]", "tbt 99 65535 90.0 -1.0 0 0 0 254 -2");
         d.nextTurn("Pine St", RIGHT, TURN, -1, 0);
         expect("after the roundabout: the next turn", "road [Pine St]", "tbt 67 65535 90.0 -1.0 0 0 0 254 -2", "hud f201430000" + utf16("Pine St"));
@@ -132,7 +217,7 @@ public final class AaTurnsTest {
         d.nextTurn("Circle Dr", RIGHT, 64, 100, 13 | 2 << 8);
         d.nextTurnDistance(800, 0, 500, MILES | 0x200);
         d.nextTurn(null, 0, 67, 0, 1);
-        expect("a roundabout in the turns ahead: its exit icon and direction (99, 90), not 64 and the raw angle",
+        expect("a roundabout in the turns ahead: its exit icon and direction (99, 90), not 64",
                 "list {1 99 90 [Circle Dr] [2] " + (800 / 1609f) + " 2}");
         d.nextTurn("Hill Rd", RIGHT, 13, 300, 0);
         expect("roundabout, exit at 225: 104 (the car's own icon), not 103",
@@ -141,7 +226,7 @@ public final class AaTurnsTest {
         expect("roundabout, exit at 315: 107 (the car's own icon), not 106",
                 "road [Lake Rd]", "tbt 107 65535 315.0 -1.0 0 0 0 254 -2", "hud f2016b0000" + utf16("Lake Rd"));
         d.nextTurn("Ash St", UNSPECIFIED, TURN, -1, 0);
-        expect("turn with no side: straight (65), not 64 (the cluster's spinner)",
+        expect("turn with no side: straight (65), not 64",
                 "road [Ash St]", "tbt 65 65535 0.0 -1.0 0 0 0 254 -2", "hud f201410000" + utf16("Ash St"));
         d.nextTurn("Somewhere", 0, 0, -1, 0);
         expect("unknown maneuver: straight (65), not 64",
@@ -161,22 +246,27 @@ public final class AaTurnsTest {
         expect("turns ahead: exit right 81, fork with no side 172, destination on the right 113 (none 64)",
                 "list {1 81 0 [Exit 5] [] " + (800 / 1609f) + " 2} {2 172 0 [Y] [] " + (1600 / 1609f) + " 2} {3 113 0 [Home] [] "
                         + (3200 / 1609f) + " 2}");
-        check("turns ahead: unknown, merge, depart: straight (65)",
-                AaTurns.aheadType(0, 0, -1) == 65 && AaTurns.aheadType(10, 0, -1) == 65 && AaTurns.aheadType(1, 0, -1) == 65);
-        check("turns ahead: on-ramp right 173, left 174; ferry 176; name change left 70",
+        check("turns ahead: unknown, merge, depart: straight (65); sided merge 66/71",
+                AaTurns.aheadType(0, 0, -1) == 65 && AaTurns.aheadType(10, 0, -1) == 65 && AaTurns.aheadType(1, 0, -1) == 65
+                        && AaTurns.aheadType(10, RIGHT, -1) == 66 && AaTurns.aheadType(10, LEFT, -1) == 71);
+        check("turns ahead: on-ramp right 173, left 174; ferry 176/176; name change left 70",
                 AaTurns.aheadType(7, RIGHT, -1) == 173 && AaTurns.aheadType(7, LEFT, -1) == 174
-                        && AaTurns.aheadType(16, 0, -1) == 176 && AaTurns.aheadType(2, LEFT, -1) == 70);
+                        && AaTurns.aheadType(16, 0, -1) == 176 && AaTurns.aheadType(17, 0, -1) == 176
+                        && AaTurns.aheadType(2, LEFT, -1) == 70);
         d.stop();
         d.end();
-        expect("connection ends during a route: cleared", "dest 0 []", "tbt 0 0 0.0 0.0 -1 0 0 0 -1",
-                "sub 0.0 -1 0 0 0 0 0 0.0 -1 0", "2c 0 0 0 0 0 0 0 0 0", "lanes f1", "hud f2", "hud f2");
+        expect("connection ends during a route: restores DisplayType 8 (COMPASS) and clears HUD",
+                "dest 0 []", "road []", "list",
+                "tbt 8 0 0.0 0.0 0 0 0 0 -1",
+                "sub 0.0 -3 15 -1 -1 -1 -1 0.0 0 -1",
+                "2c 0 0 0 0 0 0 0 0 0", "lanes f1", "hud f2", "hud f2");
         d.nextTurn("S 3 0a0102", 0, 33, 0, 0);
         expect("navigation message: nothing to the cluster");
         check("... passed on to mods that asked (projection events)", "S 3 0a0102".equals(hmgapi.hook.ProjectionHooks.last));
 
-        // tbt_standard: the car navigation's own format near a maneuver (its cluster code)
-        AaTurns s = new AaTurns(new android.content.Context(), c, new Handler());
-        s.standardTurns = true;
+        // ---- 3. Default enhanced mode (standardTurns = true) & clean maneuver distance resets
+        Context sCtx = new Context();
+        AaTurns s = new AaTurns(sCtx, c, new Handler());
         s.status(1);
         s.nextTurn("Elm St", LEFT, TURN, -1, 0);
         c.calls.clear();
@@ -184,15 +274,22 @@ public final class AaTurnsTest {
         expect("standard: 0.7 mi out: the icon (70 left), bar off", "tbt 70 65535 270.0 0.7 0 0 2 0 0", "2c 2 7 0 0 0 0 0 0 0");
         s.nextTurnDistance(440, 40, 273, MILES_P1);
         expect("standard: 440 m: TURN (13) 270, bar 90; HUD keeps its icon", "tbt 13 0 270.0 0.273 0 0 2 90 0", "2c 2 3 0 0 0 0 0 0 0");
+        Intent bar90 = sCtx.broadcasts.get(sCtx.broadcasts.size() - 1);
+        check("PHONE_TBT broadcast carries trap bar 90", bar90.getBooleanExtra("active", false) && bar90.getIntExtra("bar", -1) == 90);
         s.nextTurnDistance(274, 25, 900000, FEET);
         expect("standard: 900 ft (274 m): bar 50", "tbt 13 0 270.0 900.0 0 0 3 50 0", "2c 3 0 900 0 0 0 0 0 0");
         s.nextTurnDistance(9, 1, 29529, FEET);
         expect("standard: 29 ft: bar 10 (at least 1)", "tbt 13 0 270.0 29.529 0 0 3 10 0", "2c 3 0 29 0 0 0 0 0 0");
+
+        // Advancing to a new maneuver ("Hwy 9") clears the completed turn's 29 ft so it never flashes 29 ft
         s.nextTurn("Hwy 9", 0, 14, -1, 0);
         check("maneuver log, standard turns: also what goes out near it",
                 "HMG-API [wireless-carplay-aa] AA turn: event 14 side 0 angle -1 number 0 -> type 65 dir 0, near: type 13 dir 0".equals(android.util.Log.last));
-        expect("standard: straight near: TURN 0", "road [Hwy 9]", "tbt 13 0 0.0 29.529 0 0 3 10 0",
-                "hud f201410000" + utf16("Hwy 9"), "2c 3 0 29 0 0 0 0 0 0");
+        expect("new maneuver clears completed turn's 29 ft until new distance arrives",
+                "road [Hwy 9]", "tbt 65 65535 0.0 -1.0 0 0 0 254 -2", "hud f201410000" + utf16("Hwy 9"));
+        s.nextTurnDistance(9, 1, 29529, FEET);
+        expect("standard: straight near once distance arrives: TURN 0",
+                "tbt 13 0 0.0 29.529 0 0 3 10 0", "2c 3 0 29 0 0 0 0 0 0");
 
         final int SLIGHT = 3, SHARP = 5, UTURN = 6, ON_RAMP = 7, OFF_RAMP = 8, FORK = 9, MERGE = 10, RB_EXIT = 12, RB_BOTH = 13, DEST = 19, FERRY = 16;
         stdCase("right turn", TURN, RIGHT, 67, 90, 100, "13 90 20");
@@ -205,6 +302,8 @@ public final class AaTurnsTest {
         stdCase("exit right: EXIT_RIGHT 90", OFF_RAMP, RIGHT, 81, 30, 300, "17 90 60");
         stdCase("exit left: EXIT_LEFT 270", OFF_RAMP, LEFT, 82, 330, 300, "18 270 60");
         stdCase("merge: TURN 0", MERGE, 0, 65, 0, 100, "13 0 20");
+        stdCase("merge right: TURN 45", MERGE, RIGHT, 66, 45, 100, "13 45 20");
+        stdCase("merge left: TURN 315", MERGE, LEFT, 71, 315, 100, "13 315 20");
         stdCase("roundabout, exit at 90: roundabout (32), the exit's direction", RB_BOTH, RIGHT, 99, 90, 200, "32 90 40");
         stdCase("roundabout marked LEFT (a US one, issue #19): 32, counterclockwise, not 33", RB_EXIT, LEFT, 99, 90, 200, "32 90 40");
         stdCase("roundabout marked RIGHT: 32", RB_BOTH, RIGHT, 105, 270, 200, "32 270 40");
@@ -224,10 +323,9 @@ public final class AaTurnsTest {
         stdCase("458 m: out, the icon, bar off", TURN, RIGHT, 67, 90, 458, "67 90 0");
         stdCase("no distance yet: the icon, bar off", TURN, RIGHT, 67, 90, -1, "67 90 0");
 
-        // rerouting (status 3): "Recalculating..." (10) with standard turns, after 1 s
+        // ---- 4. Rerouting (status 3): "Recalculating..." (10) after 1 s, preserving pre-sent reroute distance
         Handler rh = new Handler();
-        AaTurns rr = new AaTurns(new android.content.Context(), c, rh);
-        rr.standardTurns = true;
+        AaTurns rr = new AaTurns(new Context(), c, rh);
         rr.status(1);
         rr.nextTurn("Elm St", RIGHT, TURN, -1, 0);
         c.calls.clear();
@@ -241,23 +339,183 @@ public final class AaTurnsTest {
         expect("reroute over 1 s: Recalculating (10)", "tbt 10 65535 0.0 0.0 -3 0 15 0 -1");
         rr.nextTurnDistance(300, 20, 186, MILES_P1);
         expect("a distance during the reroute: Recalculating stays");
-        rh.delayed = null;   // the stand-in keeps a run runnable
+        rh.delayed = null;
         rr.status(3);
         check("rerouting again while it shows: no second wait", rh.delayed == null);
         rr.nextTurn("Oak Ave", LEFT, TURN, -1, 0);
-        expect("the new route's first turn replaces it", "road [Oak Ave]", "tbt 13 0 270.0 0.186 0 0 2 60 0",
+        expect("the new route's first turn replaces it with the pre-sent reroute distance",
+                "road [Oak Ave]", "tbt 13 0 270.0 0.186 0 0 2 60 0",
                 "hud f201460000" + utf16("Oak Ave"), "2c 2 2 0 0 0 0 0 0 0");
         rr.status(3);
         rh.delayed.run();
         c.calls.clear();
         rr.status(1);
-        expect("reroute over with the same route: the turn comes back", "tbt 13 0 270.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+        expect("reroute over with the same route: the turn comes back",
+                "tbt 13 0 270.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
         Handler oh = new Handler();
-        AaTurns off = new AaTurns(new android.content.Context(), c, oh);
+        AaTurns off = new AaTurns(new Context(), c, oh);
+        off.standardTurns = false;
         off.status(1);
         off.status(3);
         check("standard turns off: no Recalculating", oh.delayed == null);
+
+        // ---- 5. 0x8006 AaNavState exact maneuvers, charging stops, roundabouts & lane side streets
+        testExactManeuversAndLanes();
+
+        // ---- 6. Smooth 250 ms approaching-turn countdown & compass quantization
+        testSmoothAndCompass();
+
         System.exit(fail);
+    }
+
+    static void testExactManeuversAndLanes() {
+        final int LEFT = 1, RIGHT = 2, UNSPECIFIED = 3, SLIGHT = 3, TURN = 4, ON_RAMP = 7, OFF_RAMP = 8, MERGE = 10;
+        final int FEET = 6, MILES_P1 = 5;
+        AaTurns x = new AaTurns(new Context(), c, new Handler());
+        x.status(1);
+        c.calls.clear();
+
+        // KEEP_LEFT (55, collapsed by GPM to SLIGHT_TURN LEFT) -> fork icon 174 far, FORK_2 (25) 270 near
+        W dumpKeep = new W().m(1, step(AaNavState.M_KEEP_LEFT, -1, -1, "I-5 N"))
+                .m(1, step(AaNavState.M_OFF_RAMP_SLIGHT_RIGHT, -1, -1, "Exit 12"));
+        x.nextTurn(dumpKeep.dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("I-5 N", LEFT, SLIGHT, -1, 0);
+        x.nextTurnDistance(800, 30, 500, MILES_P1);
+        expect("0x8006 KEEP_LEFT far: fork left 174 + 2nd-step HUD exit right 81 (0x51)",
+                "road [I-5 N]", "tbt 174 65535 0.0 -1.0 0 0 0 254 -2",
+                "hud f202ae5100" + utf16("I-5 N"),
+                "tbt 174 65535 0.0 0.5 0 0 2 0 0", "2c 2 5 0 0 0 0 0 0 0");
+        x.nextTurnDistance(200, 10, 124, MILES_P1);
+        expect("0x8006 KEEP_LEFT near: FORK_2 (25) 270 instead of intersection slight-left TURN",
+                "tbt 25 0 270.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+
+        // EV_AHEAD_END with 0 clears stale 2nd-step HUD icon when rawNextIcon is also cleared
+        W singleStep = new W().m(1, step(AaNavState.M_OFF_RAMP_SLIGHT_RIGHT, -1, -1, "Exit 12"));
+        x.nextTurn(singleStep.dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("Exit 12", UNSPECIFIED, OFF_RAMP, -1, 0);
+        x.nextTurnDistance(300, 12, 186, MILES_P1);
+        expect("0x8006 OFF_RAMP_SLIGHT_RIGHT recovers RIGHT side when legacy side is UNSPECIFIED -> EXIT_RIGHT (17)",
+                "road [Exit 12]", "tbt 81 65535 30.0 -1.0 0 0 0 254 -2",
+                "hud f201510000" + utf16("Exit 12"),
+                "tbt 17 0 90.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+
+        // ON_RAMP_SHARP_LEFT -> 225 deg near; MERGE_RIGHT -> 66 (45 deg)
+        x.nextTurn(new W().m(1, step(AaNavState.M_ON_RAMP_SHARP_LEFT, -1, -1, "US-101")).dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("US-101", LEFT, ON_RAMP, -1, 0);
+        x.nextTurnDistance(150, 8, 492000, FEET);
+        expect("0x8006 ON_RAMP_SHARP_LEFT near: TURN 225",
+                "road [US-101]", "tbt 174 65535 330.0 -1.0 0 0 0 254 -2",
+                "hud f201ae0000" + utf16("US-101"),
+                "tbt 13 0 225.0 492.0 0 0 3 30 0", "2c 3 0 492 0 0 0 0 0 0");
+
+        x.nextTurn(new W().m(1, step(AaNavState.M_MERGE_RIGHT, -1, -1, "I-90")).dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("I-90", UNSPECIFIED, MERGE, -1, 0);
+        x.nextTurnDistance(200, 8, 124, MILES_P1);
+        expect("0x8006 MERGE_RIGHT: icon 66 on HUD, TURN 45 near",
+                "road [I-90]", "tbt 66 65535 45.0 -1.0 0 0 0 254 -2",
+                "hud f201420000" + utf16("I-90"),
+                "tbt 13 0 45.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+
+        // Clockwise (LHT) roundabout + "At the roundabout, " prefix stripping + exit preservation
+        x.nextTurn(new W().m(1, step(AaNavState.M_ROUNDABOUT_ENTER_AND_EXIT_CW_WITH_ANGLE, 2, 90, "High St")).dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("At the roundabout, take the 2nd exit", LEFT, 13, 100, 2);
+        x.nextTurnDistance(200, 10, 124, MILES_P1);
+        expect("0x8006 CW roundabout: prefix stripped, clockwise icon 195 (0xc3) on HUD, TYPE_ROUNDABOUT_LEFT (33) near",
+                "road [Take the 2nd exit]", "tbt 195 65535 90.0 -1.0 0 0 0 254 -2",
+                "hud f201c30000" + utf16("Take the 2nd exit"),
+                "tbt 33 0 90.0 0.124 0 0 2 40 0", "2c 2 1 0 0 0 0 0 0 0");
+        x.nextTurn("High St", UNSPECIFIED, 12, -1, 0);
+        x.nextTurnDistance(40, 4, 131000, FEET);
+        expect("CW roundabout preserved into ROUNDABOUT_EXIT: stays TYPE_ROUNDABOUT_LEFT (33) 90",
+                "road [High St]", "tbt 195 65535 90.0 -1.0 0 0 0 254 -2",
+                "hud f201c30000" + utf16("High St"),
+                "tbt 33 0 90.0 131.0 0 0 3 10 0", "2c 3 0 131 0 0 0 0 0 0");
+
+        // Standalone two-step ROUNDABOUT_ENTER looking ahead to step 1's exitNumber=3 -> 105 (270 deg)
+        W twoStepRb = new W().m(1, step(AaNavState.M_ROUNDABOUT_ENTER_CCW, -1, -1, "Dupont Cir"))
+                .m(1, step(AaNavState.M_ROUNDABOUT_EXIT_CCW, 3, -1, "Mass Ave"));
+        x.nextTurn("Bridge St", RIGHT, TURN, -1, 0); // leave previous roundabout first
+        c.calls.clear();
+        x.nextTurn(twoStepRb.dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        x.nextTurn("Dupont Cir", 0, 11, 0, 0);
+        x.nextTurnDistance(150, 9, 492000, FEET);
+        expect("standalone ROUNDABOUT_ENTER uses step[1] exitNumber=3 -> 105 / 270 deg",
+                "road [Dupont Cir]", "tbt 105 65535 270.0 -1.0 0 0 0 254 -2",
+                "hud f202696900" + utf16("Dupont Cir"),
+                "tbt 32 0 270.0 492.0 0 0 3 30 0", "2c 3 0 492 0 0 0 0 0 0");
+
+        // Charging-stop destination formatting (" - 18 min charge")
+        x.nextTurn("Ionity", 0, AaTurns.EV_DEST_NAME, 0, 1);
+        expect("plain destination name before charging dump", "dest 0 [Ionity]");
+        W chg = new W().m(2, new W().s(1, "Ionity").m(2, new W().v(1, 15000).v(2, 150000).v(3, 1080)));
+        x.nextTurn(chg.dumpS(), 0, AaTurns.EV_DUMP, 0, 0);
+        expect("charging stop destination updated with planned charge minutes", "dest 0 [Ionity - 18 min charge]");
+
+        // Lane-derived intersection side streets (straight=1, right=3, left=7 -> 4-way crossroad 0x811 = 2065)
+        x.nextTurn("2nd Ave", RIGHT, TURN, -1, 0);
+        x.nextTurnDistance(120, 8, 394000, FEET);
+        c.calls.clear();
+        String crossLanes = "03" + "01070000" + "01010000" + "02030000";
+        x.nextTurn(crossLanes, 0, AaTurns.EV_LANES, 0, 0);
+        check("laneSideStreets: 4-way crossroad (left 270 + straight 0 + right 90) -> 0x811 (2065)",
+                AaTurns.laneSideStreets(90, new int[] { 7, 1, 3 }) == 0x811
+                        && AaTurns.laneSideStreets(90, new int[] { 3 }) == 0
+                        && AaTurns.laneSideStreets(90, new int[] { 7, 5 }) == 0);
+        expect("near TURN re-emits tbtInfo with lane-derived sideStreets 2065 (0x811)",
+                "lanes f10300010102" + "00000000000000000000000000" + "07000001000003",
+                "tbt 13 2065 90.0 394.0 0 0 3 20 0", "2c 3 0 394 0 0 0 0 0 0");
+    }
+
+    static void testSmoothAndCompass() {
+        check("clusterCompassDeg quantizes counter-clockwise 22.5 deg steps",
+                AaTurns.clusterCompassDeg(0) == 0f
+                        && AaTurns.clusterCompassDeg(90) == 270f
+                        && AaTurns.clusterCompassDeg(180) == 180f
+                        && AaTurns.clusterCompassDeg(270) == 90f
+                        && AaTurns.clusterCompassDeg(30) == 337.5f);
+
+        AaTurns.testNow = 10000L;
+        Handler sh = new Handler();
+        AaTurns sm = new AaTurns(new Context(), c, sh);
+        sm.status(1);
+        sm.nextTurn("Market St", 2, 4, -1, 0);
+        c.calls.clear();
+
+        // First sample at t=10000ms: 300 m, 15 s -> initial velocity 20 m/s
+        sm.nextTurnDistance(300, 15, 186, 5);
+        expect("smooth t=0: 300 m (0.186 mi), bar 60", "tbt 13 0 90.0 0.186 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+        check("smooth 250 ms tick scheduled", sh.scheduled.containsKey(sm.smooth));
+
+        // 500 ms later: est = 300 - 20*0.5 = 290 m (0.180 mi)
+        AaTurns.testNow = 10500L;
+        sm.smooth.run();
+        expect("smooth t=500ms: glides down to 290 m (0.18 mi)", "tbt 13 0 90.0 0.18 0 0 2 60 0", "2c 2 2 0 0 0 0 0 0 0");
+
+        // Second raw report at t=11000ms: 280 m, seconds=0 (AA hits 0s early) -> observed v = 20 m/s continues!
+        AaTurns.testNow = 11000L;
+        sm.nextTurnDistance(280, 0, 174, 5);
+        c.calls.clear();
+        AaTurns.testNow = 11500L;
+        sm.smooth.run();
+        expect("smooth continues from observed velocity even when seconds == 0 (270 m -> 0.167 mi, bar 50)",
+                "tbt 13 0 90.0 0.167 0 0 2 50 0", "2c 2 2 0 0 0 0 0 0 0");
+
+        // Red-light stop: at t=12500ms phone still reports 280 m (dm <= 0) -> v = 0, no rubber-band or drift!
+        AaTurns.testNow = 12500L;
+        sm.nextTurnDistance(280, 14, 174, 5);
+        c.calls.clear();
+        check("stationary at red light (dm <= 0): smooth countdown pauses instead of drifting",
+                !sh.scheduled.containsKey(sm.smooth));
+
+        // Resume motion at t=13500ms (260 m -> v = 20 m/s), then phone goes silent past 1750 ms -> holds!
+        AaTurns.testNow = 13500L;
+        sm.nextTurnDistance(260, 13, 161, 5);
+        c.calls.clear();
+        AaTurns.testNow = 15500L; // dt = 2000 ms > SMOOTH_STALE_MS (1750 ms)
+        sm.smooth.run();
+        expect("phone silent > 1750 ms: holds last displayed distance without running past turn");
+
+        AaTurns.testNow = -1;
     }
 
     static void stdCase(String what, int ev, int side, int icon, int iconDir, int m, String want) {

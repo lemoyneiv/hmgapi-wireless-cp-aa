@@ -23,20 +23,25 @@ typedef int (*LogControlFn)(const char *);
 typedef const char *(*GetStringUTFCharsFn)(void *env, void *str, unsigned char *isCopy);
 typedef void (*ReleaseStringUTFCharsFn)(void *env, void *str, const char *chars);
 
+static LogControlFn cached_control;
+
 __attribute__((visibility("default")))
 int Java_hmgapi_mods_wireless_dipo_CarPlayLog_control(void *env, void *cls, void *command)
 {
     void **table = *(void ***)env;
-    void *lib;
     LogControlFn control;
     const char *s;
     int r;
     (void)cls;
     if (!command) return -1;
-    lib = dlopen("libCarPlayCoreUtils.so", 0);
-    if (!lib) return -2;
-    control = (LogControlFn)dlsym(lib, "LogControl");
-    if (!control) return -3;
+    control = __atomic_load_n(&cached_control, __ATOMIC_ACQUIRE);
+    if (!control) {
+        void *lib = dlopen("libCarPlayCoreUtils.so", 0);
+        if (!lib) return -2;
+        control = (LogControlFn)dlsym(lib, "LogControl");
+        if (!control) return -3;
+        __atomic_store_n(&cached_control, control, __ATOMIC_RELEASE);
+    }
     s = ((GetStringUTFCharsFn)table[169])(env, command, 0);
     if (!s) return -4;
     r = control(s);
