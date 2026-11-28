@@ -29,13 +29,25 @@ public final class AaSupportTest {
         return mod;
     }
 
+    private static final LinkedHashSet<String> GPM_STOCK_SAFE_HOOKS = new LinkedHashSet<String>(Arrays.asList(
+            "framework.context_impl.start_service",
+            "gpm.sensor_source.init",
+            "gpm.receiver.destroy",
+            "gpm.receiver_service.disconnected"));
+
     private static void rejectsGpm(File library) {
         ModContext mod = enabled();
         new Wireless(library).appLoaded(mod, new LoadedApp(Wireless.GPM));
         check(mod.natives.isEmpty(), "unverified AA must not request a native patch");
-        check(mod.hooks.size() == 1 && mod.hooks.containsKey("framework.context_impl.start_service"),
-                "unverified AA keeps only the independent USB hook, without navigation/callback hooks");
+        check(mod.hooks.keySet().equals(GPM_STOCK_SAFE_HOOKS),
+                "unverified AA keeps only independent stock-safe USB and compass hooks, without navigation/callback hooks");
         check(mod.logs.toString().contains("no verified recipe"), "owner gets a reason AA TBT is off");
+
+        ModContext noCompass = enabled();
+        noCompass.settings.put("aa_compass", false);
+        new Wireless(library).appLoaded(noCompass, new LoadedApp(Wireless.GPM));
+        check(noCompass.hooks.size() == 1 && noCompass.hooks.containsKey("framework.context_impl.start_service"),
+                "aa_compass=false leaves only the USB hook on unverified AA");
     }
 
     private static void navigation(File library, int step, boolean aa, boolean cp, boolean skip) throws Throwable {
@@ -59,8 +71,9 @@ public final class AaSupportTest {
         check(mod.hooks.keySet().equals(new LinkedHashSet<String>(Arrays.asList(
                 "framework.context_impl.start_service", "gpm.navigation_status.init",
                 "gpm.navigation_status.next_turn", "gpm.navigation_status.next_turn_distance",
-                "gpm.navigation_status.status", "gpm.receiver.send_navigation_focus", "gpm.receiver.destroy"))),
-                "supported AA installs all dependent hooks and preserves USB protection");
+                "gpm.navigation_status.status", "gpm.receiver.send_navigation_focus", "gpm.receiver.destroy",
+                "gpm.sensor_source.init", "gpm.receiver_service.disconnected"))),
+                "supported AA installs all dependent hooks plus car compass and preserves USB protection");
         Object receiver = new Object(), status = new Object();
         Object receiver2 = new Object(), status2 = new Object();
         Points.receivers.put(status, receiver);
@@ -137,14 +150,28 @@ public final class AaSupportTest {
         ModContext disabled = enabled();
         disabled.settings.put("tbt", false);
         new Wireless(library).appLoaded(disabled, new LoadedApp(Wireless.GPM));
-        new Wireless(library).appLoaded(disabled, new LoadedApp(Wireless.NAVIGATION));
-        check(disabled.natives.isEmpty() && disabled.hooks.size() == 1,
-                "supported library still honors tbt=false and preserves USB hook");
+        check(disabled.natives.isEmpty() && disabled.hooks.keySet().equals(GPM_STOCK_SAFE_HOOKS),
+                "supported library honors tbt=false while preserving USB and aa_compass hooks");
+        ModContext disabledNav = enabled();
+        disabledNav.settings.put("tbt", false);
+        new Wireless(library).appLoaded(disabledNav, new LoadedApp(Wireless.NAVIGATION));
+        check(disabledNav.hooks.size() == NaviBridge.COMPASS_POINTS.length,
+                "tbt=false with aa_compass=true keeps non-suppressing compass feed in NAVIGATION");
+        for (MethodHook h : disabledNav.hooks.values()) {
+            check(!h.skipsOriginal(), "tbt=false compass feed never suppresses stock navigation");
+        }
+        ModContext allOff = enabled();
+        allOff.settings.put("tbt", false);
+        allOff.settings.put("aa_compass", false);
+        new Wireless(library).appLoaded(allOff, new LoadedApp(Wireless.GPM));
+        new Wireless(library).appLoaded(allOff, new LoadedApp(Wireless.NAVIGATION));
+        check(allOff.natives.isEmpty() && allOff.hooks.size() == 1,
+                "tbt=false and aa_compass=false leaves only USB hook");
         ModContext own = enabled();
         Car.step = 999;
         new Wireless(library).appLoaded(own, new LoadedApp(Wireless.GPM));
-        check(own.natives.isEmpty() && own.hooks.size() == 1,
-                "supported library leaves step999 stock turn manager alone");
+        check(own.natives.isEmpty() && own.hooks.keySet().equals(GPM_STOCK_SAFE_HOOKS),
+                "supported library leaves step999 stock turn manager alone while keeping USB and aa_compass");
         Car.step = 105;
         Points.receivers.clear();
         AaTurns.instances.clear();
@@ -199,12 +226,25 @@ public final class AaSupportTest {
             ModContext off = enabled();
             off.settings.put("tbt", false);
             wireless.appLoaded(off, new LoadedApp(Wireless.GPM));
-            wireless.appLoaded(off, new LoadedApp(Wireless.NAVIGATION));
-            check(off.natives.isEmpty() && off.hooks.size() == 1, "tbt=false still leaves only USB hook");
+            check(off.natives.isEmpty() && off.hooks.keySet().equals(GPM_STOCK_SAFE_HOOKS),
+                    "tbt=false keeps USB and aa_compass hooks in GPM");
+            ModContext offNav = enabled();
+            offNav.settings.put("tbt", false);
+            wireless.appLoaded(offNav, new LoadedApp(Wireless.NAVIGATION));
+            check(offNav.hooks.size() == NaviBridge.COMPASS_POINTS.length,
+                    "tbt=false installs only non-suppressing compass feed in NAVIGATION");
+            ModContext offBoth = enabled();
+            offBoth.settings.put("tbt", false);
+            offBoth.settings.put("aa_compass", false);
+            wireless.appLoaded(offBoth, new LoadedApp(Wireless.GPM));
+            wireless.appLoaded(offBoth, new LoadedApp(Wireless.NAVIGATION));
+            check(offBoth.natives.isEmpty() && offBoth.hooks.size() == 1,
+                    "tbt=false and aa_compass=false leaves only USB hook");
             ModContext stock = enabled();
             Car.step = 999;
             wireless.appLoaded(stock, new LoadedApp(Wireless.GPM));
-            check(stock.natives.isEmpty() && stock.hooks.size() == 1, "native GPM TBT is preserved at step 999");
+            check(stock.natives.isEmpty() && stock.hooks.keySet().equals(GPM_STOCK_SAFE_HOOKS),
+                    "native GPM TBT is preserved at step 999 while keeping USB and aa_compass");
             Car.step = 105;
             testNaviBridge(unknown);
             if (args.length > 0) {
@@ -293,6 +333,7 @@ public final class AaSupportTest {
         MethodHook.Param p1 = hTbt.beforeMethod(mTbt, target, 8, 0, 225f);
         MethodHook.Param p2 = hSub.beforeMethod(mSub, target, 0f, -3, 15, -1, -1, -1, -1, 225f, 0, -1);
         check(!hTbt.skipsOriginal(), "idle stock compass passes through");
+        check(bridge.lastCompassDeg() == 135f, "cluster 225.0 deg CCW converts to 135.0 deg SE true bearing");
 
         Object[] trap17 = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 0, 0, 0, 0 };
         hTrapInt.beforeMethod(mTrapInt, target, trap17);
@@ -314,6 +355,14 @@ public final class AaSupportTest {
         check(stockObj.barGraphLevel == 0, "original stock NaviTbtTrapInfo instance is never mutated");
         target.replayed.clear();
 
+        // Suppressed stock sub-info updates still capture live 7.5-deg CompassDegree (172.5 CCW -> 187.5 SSW),
+        // while directionErr != 0 (-1) is ignored
+        MethodHook.Param pSup = hSub.beforeMethod(mSub, target, 0f, -3, 15, -1, -1, -1, -1, 172.5f, 0, -1);
+        check(pSup.isReturnEarly() && bridge.lastCompassDeg() == 187.5f,
+                "suppressed stock sub-info still updates car compass heading (172.5 CCW -> 187.5 deg)");
+        hSub.beforeMethod(mSub, target, 10f, 0, 2, 8, 0, 1, 1, 0f, -1, 1);
+        check(bridge.lastCompassDeg() == 187.5f, "directionErr != 0 never clobbers cached car compass heading");
+
         // 3. Stock navigation updates speed limit to 55 mph during phone guidance: outgoing gets bar=80, baseline saves bar=0/speed=55
         NaviBridge.testNow = 2500L;
         Object[] trap55 = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 55, 0, 0, 0, 0 };
@@ -332,8 +381,8 @@ public final class AaSupportTest {
         bridge.onPhoneTbt("aa", false, -1, 3000L);
         Handler.drain();
         check(!bridge.shouldSuppress(3200L), "END_GRACE_MS prevents lagging Car.aaGuiding from blocking compass recovery");
-        check(target.replayed.contains("tbt 8 0 225.0") && target.replayed.contains("sub -3 225.0"),
-                "stock DisplayType 8 compass and heading sub-info replayed immediately on route end");
+        check(target.replayed.contains("tbt 8 0 225.0") && target.replayed.contains("sub -3 172.5"),
+                "stock DisplayType 8 compass and latest 172.5 heading sub-info replayed immediately on route end");
         check(target.replayed.contains("trapInt bar=0 speed=55") && target.replayed.contains("trapObj bar=0 speed=55 unit=2"),
                 "trap bar restored to 0 with latest 55 mph speed limit preserved");
 

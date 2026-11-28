@@ -10,6 +10,7 @@ fi
 CP=$(mktemp -d); trap 'rm -rf "$CP"' EXIT
 javac --release 8 -Xlint:-options -nowarn -cp "$ANDROID_JAR" -d "$CP" \
     $(find stubs test -name '*.java') \
+    ../../src/hmgapi/mods/wireless/AaCompass.java \
     ../../src/hmgapi/mods/wireless/AaTbtSupport.java \
     ../../src/hmgapi/mods/wireless/NaviBridge.java \
     ../../src/hmgapi/mods/wireless/Wireless.java

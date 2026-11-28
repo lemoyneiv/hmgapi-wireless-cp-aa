@@ -51,10 +51,12 @@ final class NaviBridge {
     static final long IPC_CACHE_MS = 250;
     static final long MIN_TRAP_GAP_MS = 200;
     static final long COMPASS_FOLLOWUP_MS = 300;
+    static final long COMPASS_HEARTBEAT_MS = 5000;
 
     static final String PT_TBT_INFO = "update_tbt_info";
     static final String PT_SUB_INFO = "update_tbt_sub_info";
     static final String PT_SUB_INFO_B = "update_tbt_sub_info_b";
+    static final String[] COMPASS_POINTS = { PT_TBT_INFO, PT_SUB_INFO, PT_SUB_INFO_B };
     static final String PT_TRAP_INT = "framework.navigation_cluster.update_tbt_trap_info";
     static final String PT_TRAP_NEW = "framework.navigation_cluster.update_tbt_trap_info_new";
     static final String PT_TRAP_CLS = "framework.navi_tbt_trap_info";
@@ -101,10 +103,13 @@ final class NaviBridge {
     private boolean ipcGuiding;
     private boolean wasGuiding;
 
-    // Latest stock compass frames captured from com.mnsoft.navi
+    // Latest stock compass frames & dead-reckoned car heading captured from com.mnsoft.navi
     private boolean stockShowingCompass;
     private Call compassTbt, compassSub;
     private int compassReplayGen;
+    private float lastCompassDeg = Float.NaN;
+    private boolean hasSubCompass;
+    private long lastCompassBroadcastAt = -COMPASS_HEARTBEAT_MS;
 
     // Latest stock trap frames captured from com.mnsoft.navi
     private Call trapInt, trapObj;
@@ -149,22 +154,7 @@ final class NaviBridge {
             bg = new Handler(ht.getLooper());
         }
         final NaviBridge bridge = new NaviBridge(mod, app.context, aaGuidance, bg);
-        if (app.context != null) {
-            try {
-                app.context.registerReceiver(new BroadcastReceiver() {
-                    @Override
-                    public void onReceive(Context c, Intent i) {
-                        if (i == null) return;
-                        String src = i.getStringExtra(EXTRA_SOURCE);
-                        boolean active = i.getBooleanExtra(EXTRA_ACTIVE, false);
-                        int bar = i.getIntExtra(EXTRA_BAR, -1);
-                        bridge.onPhoneTbt(src, active, bar, now());
-                    }
-                }, new IntentFilter(ACTION_PHONE_TBT));
-            } catch (Throwable t) {
-                mod.error("navigation: phone TBT receiver", t);
-            }
-        }
+        bridge.registerBridgeReceiver(true);
         for (final String m : tbtPoints) {
             final Holder h = new Holder();
             Member mem = mod.hook(null, "framework.navigation_cluster." + m, new MethodHook() {
@@ -180,6 +170,48 @@ final class NaviBridge {
         }
         bridge.installTrapHooks();
         return bridge;
+    }
+
+    /** Non-suppressing compass listener used when tbt=false and aa_compass=true. */
+    static NaviBridge installCompassOnly(final ModContext mod, final LoadedApp app) {
+        final NaviBridge bridge = new NaviBridge(mod, app.context, false, null);
+        bridge.registerBridgeReceiver(false);
+        for (final String m : COMPASS_POINTS) {
+            mod.hook(null, "framework.navigation_cluster." + m, new MethodHook() {
+                @Override
+                protected void beforeHookedMethod(Param p) {
+                    if (REPLAYING.get() != null) return;
+                    bridge.recordCarCompass(m, p.args, now());
+                }
+            });
+        }
+        return bridge;
+    }
+
+    private void registerBridgeReceiver(final boolean listenPhoneTbt) {
+        if (context == null) return;
+        try {
+            IntentFilter f = new IntentFilter();
+            if (listenPhoneTbt) f.addAction(ACTION_PHONE_TBT);
+            f.addAction(AaCompass.ACTION_REQUEST_COMPASS);
+            context.registerReceiver(new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, Intent i) {
+                    if (i == null) return;
+                    String act = i.getAction();
+                    if (listenPhoneTbt && ACTION_PHONE_TBT.equals(act)) {
+                        String src = i.getStringExtra(EXTRA_SOURCE);
+                        boolean active = i.getBooleanExtra(EXTRA_ACTIVE, false);
+                        int bar = i.getIntExtra(EXTRA_BAR, -1);
+                        onPhoneTbt(src, active, bar, now());
+                    } else if (AaCompass.ACTION_REQUEST_COMPASS.equals(act)) {
+                        onCompassRequested(now());
+                    }
+                }
+            }, f);
+        } catch (Throwable t) {
+            mod.error("navigation: bridge receiver", t);
+        }
     }
 
     private static final class Holder {
@@ -285,20 +317,72 @@ final class NaviBridge {
         return dst;
     }
 
-    /** Records stock compass frames before suppression so they can be replayed when guidance ends. */
-    synchronized void onStockTbtCall(String point, Method method, Object target, Object[] args, long nowMs) {
+    /** Records stock compass frames before suppression and forwards car bearing updates to GPM. */
+    void onStockTbtCall(String point, Method method, Object target, Object[] args, long nowMs) {
         if (args == null) return;
-        if (PT_TBT_INFO.equals(point) && args.length >= 1 && args[0] instanceof Integer) {
-            int type = (Integer) args[0];
-            stockShowingCompass = (type == TYPE_COMPASS);
-            if (stockShowingCompass && method != null && target != null) {
-                compassTbt = new Call(method, target, args.clone());
+        float toSend;
+        synchronized (this) {
+            if (PT_TBT_INFO.equals(point) && args.length >= 1 && args[0] instanceof Integer) {
+                int type = (Integer) args[0];
+                stockShowingCompass = (type == TYPE_COMPASS);
+                if (stockShowingCompass && method != null && target != null) {
+                    compassTbt = new Call(method, target, args.clone());
+                }
+            } else if ((PT_SUB_INFO.equals(point) || PT_SUB_INFO_B.equals(point)) && args.length >= 9) {
+                if ((stockShowingCompass || Integer.valueOf(-3).equals(args[1]))
+                        && Integer.valueOf(0).equals(args[8]) && method != null && target != null) {
+                    compassSub = new Call(method, target, args.clone());
+                }
             }
-        } else if ((PT_SUB_INFO.equals(point) || PT_SUB_INFO_B.equals(point)) && args.length >= 9) {
-            if ((stockShowingCompass || Integer.valueOf(-3).equals(args[1])) && method != null && target != null) {
-                compassSub = new Call(method, target, args.clone());
+            toSend = recordCompassLocked(point, args, nowMs);
+        }
+        if (!Float.isNaN(toSend)) AaCompass.broadcastCarCompass(context, toSend);
+    }
+
+    void recordCarCompass(String point, Object[] args, long nowMs) {
+        float toSend;
+        synchronized (this) {
+            toSend = recordCompassLocked(point, args, nowMs);
+        }
+        if (!Float.isNaN(toSend)) AaCompass.broadcastCarCompass(context, toSend);
+    }
+
+    void onCompassRequested(long nowMs) {
+        float toSend = Float.NaN;
+        synchronized (this) {
+            if (!Float.isNaN(lastCompassDeg) && mod.enabled() && mod.settingBoolean("aa_compass", true)) {
+                lastCompassBroadcastAt = nowMs;
+                toSend = lastCompassDeg;
             }
         }
+        if (!Float.isNaN(toSend)) AaCompass.broadcastCarCompass(context, toSend);
+    }
+
+    synchronized float lastCompassDeg() {
+        return lastCompassDeg;
+    }
+
+    private float recordCompassLocked(String point, Object[] args, long nowMs) {
+        if (args == null) return Float.NaN;
+        float deg = Float.NaN;
+        if (PT_SUB_INFO.equals(point) || PT_SUB_INFO_B.equals(point)) {
+            deg = AaCompass.extractSubInfoBearing(args);
+            if (!Float.isNaN(deg)) hasSubCompass = true;
+        } else if (PT_TBT_INFO.equals(point) && !hasSubCompass) {
+            deg = AaCompass.extractTbtInfoFallbackBearing(args);
+        }
+        if (Float.isNaN(deg)) return Float.NaN;
+        boolean changed = Float.isNaN(lastCompassDeg) || angularDiff(deg, lastCompassDeg) >= 0.05f;
+        lastCompassDeg = deg;
+        if (!mod.enabled() || !mod.settingBoolean("aa_compass", true)) return Float.NaN;
+        if (!changed && nowMs - lastCompassBroadcastAt < COMPASS_HEARTBEAT_MS) return Float.NaN;
+        lastCompassBroadcastAt = nowMs;
+        return deg;
+    }
+
+    private static float angularDiff(float a, float b) {
+        float d = Math.abs(a - b) % 360f;
+        return d > 180f ? 360f - d : d;
     }
 
     /** True when stock TBT / unmarked lane calls should be suppressed in favor of phone guidance. */

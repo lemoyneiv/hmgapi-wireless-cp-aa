@@ -106,6 +106,7 @@ public final class Wireless extends ModEntry {
         if (IAP2.equals(app.packageName)) iap2(mod, app);
         if (GPM.equals(app.packageName) && mod.settingBoolean("usb_drives", true)) usbDrives(mod, app);
         if (GPM.equals(app.packageName) && mod.settingBoolean("tbt", true)) gpmTurnByTurn(mod, app);
+        if (GPM.equals(app.packageName) && mod.settingBoolean("aa_compass", true)) AaCompass.installGpm(mod, app);
         if (BTSETTINGS.equals(app.packageName) && mod.settingBoolean("menu", true)) phoneProjectionMenu(mod, app);
         if ((SYSTEM_POPUP.equals(app.packageName) || LAUNCHER.equals(app.packageName) || SETTINGS_APP.equals(app.packageName))
                 && mod.settingBoolean("menu", true)) popupSettings(mod, app);
@@ -132,7 +133,13 @@ public final class Wireless extends ModEntry {
      * and the phone's countdown bar is spliced into copies of its speed-limit trap frames.
      */
     private void navigation(final ModContext mod, final LoadedApp app) {
-        if (!mod.settingBoolean("tbt", true)) return;
+        if (!mod.settingBoolean("tbt", true)) {
+            if (mod.settingBoolean("aa_compass", true)) {
+                NaviBridge.installCompassOnly(mod, app);
+                mod.log("navigation: car compass feed for Android Auto in " + app.processName);
+            }
+            return;
+        }
         // Keep stock navigation available when this mod cannot supply AA turns. CarPlay
         // and cars with GPM's own turn-by-turn retain their existing arbitration.
         final boolean aaGuidance = Car.stepOfSpec() >= 999 || aaTbtSupported();

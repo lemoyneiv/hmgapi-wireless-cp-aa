@@ -19,6 +19,11 @@ public abstract class MethodHook {
     public final void after(Object target, Object... args) throws Throwable {
         afterMethod(null, target, args);
     }
+    public final void afterResult(Object target, Object result, Object... args) throws Throwable {
+        Param p = param(null, target, args);
+        p.result = result;
+        afterHookedMethod(p);
+    }
     public final void afterMethod(java.lang.reflect.Member m, Object target, Object... args) throws Throwable {
         afterHookedMethod(param(m, target, args));
     }
@@ -33,7 +38,10 @@ public abstract class MethodHook {
         public java.lang.reflect.Member method;
         public Object thisObject;
         public Object[] args = new Object[0];
+        private Object result;
         private boolean returnEarly;
-        public void setResult(Object result) { returnEarly = true; }
+        public Object getResult() { return result; }
+        public void setResult(Object result) { this.result = result; returnEarly = true; }
+        public boolean isReturnEarly() { return returnEarly; }
     }
 }

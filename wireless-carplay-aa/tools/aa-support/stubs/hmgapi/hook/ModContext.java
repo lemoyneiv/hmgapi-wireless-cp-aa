@@ -11,12 +11,30 @@ public final class ModContext {
     public final Map<String, MethodHook> hooks = new LinkedHashMap<String, MethodHook>();
     public final List<String> natives = new ArrayList<String>();
     public final List<String> logs = new ArrayList<String>();
+    public boolean modEnabled = true;
     public int cpStarts;
+    public boolean enabled() { return modEnabled; }
     public boolean settingBoolean(String key, boolean fallback) {
         return settings.containsKey(key) ? settings.get(key) : fallback;
     }
-    public java.lang.reflect.Member hook(ClassLoader cl, String point, MethodHook hook) {
-        hooks.put(point, hook);
+    public java.lang.reflect.Member hook(ClassLoader cl, String point, final MethodHook hook) {
+        final MethodHook prev = hooks.get(point);
+        if (prev == null) {
+            hooks.put(point, hook);
+        } else {
+            hooks.put(point, new MethodHook() {
+                @Override
+                protected void beforeHookedMethod(Param p) throws Throwable {
+                    prev.beforeHookedMethod(p);
+                    if (!p.isReturnEarly()) hook.beforeHookedMethod(p);
+                }
+                @Override
+                protected void afterHookedMethod(Param p) throws Throwable {
+                    hook.afterHookedMethod(p);
+                    prev.afterHookedMethod(p);
+                }
+            });
+        }
         return null;
     }
     public void nativePatch(LoadedApp app, String library) { natives.add(library); }

@@ -445,6 +445,8 @@
       "gpm.navigation_status.status": "observe",
       "gpm.receiver.send_navigation_focus": "observe",
       "gpm.receiver.destroy": "observe",
+      "gpm.receiver_service.disconnected": "observe",
+      "gpm.sensor_source.init": "change",
       "dipo.iap2_proxy.stop_route_guidance": "observe",
       "dipo.btcm.register_listener": "observe",
       "dipo.carplay.session_created": "observe",

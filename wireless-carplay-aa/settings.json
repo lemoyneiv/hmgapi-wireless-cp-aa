@@ -18,6 +18,14 @@
       "description": "Enabled by default: renders Android Auto and CarPlay turns, highway exits, forks, U-turns and roundabouts as native dynamic cluster scenes with intersection side streets (from CarPlay junction geometry and Android Auto lane guidance), drives the cluster's approach countdown bar alongside stock speed limits, animates the AR HUD arrow, decodes full Android Auto route/charging-stop details, and glides distances smoothly every 250 ms. Turn off to fall back to flat projection icons. Takes effect when the head unit restarts."
     },
     {
+      "key": "aa_compass",
+      "type": "toggle",
+      "default": true,
+      "title": "Car compass heading for Android Auto",
+      "apply": "restart",
+      "description": "Sends the car's dead-reckoned dash compass heading to Android Auto (SENSOR_COMPASS), keeping Google Maps oriented accurately while parked or pulling out instead of spinning on noisy stationary GPS. Hooks only (no files or library patches needed). Takes effect when the head unit restarts."
+    },
+    {
       "key": "bridge",
       "type": "toggle",
       "default": true,
